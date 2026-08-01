@@ -7,11 +7,12 @@ const dynamoClient = new DynamoDBClient();
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 /* This function is designed to be called from a webhook in a Kit rule.
-   It's a good idea to always return 200 (success) because Kit will disable a webhook rule
+   Always return 200 (success), even if the function fails, because Kit will disable a webhook rule
    if it fails too frequently.
    Kit support aren't clear about the exact definition of "fails too frequently" but this 
-   has happened in production. Contact jo@redkite.biz for more information!
-   Better to alert admin if the function fails.
+   has happened in production. 
+   Contact jo@redkite.biz for more information!
+   TODO: Better to alert admin if the function fails.
 */
 const returnStatusCode = 200;
 
@@ -20,7 +21,7 @@ export const handler = async (event) => {
     // Extract subscriber info from event
     const subscriberNames = splitName(event.subscriber.first_name);
  	
-	// Zoom will not accept empty name fields
+	// Zoom will reject empty name fields
     if (subscriberNames[0] === '') {
         subscriberNames[0] = "-";
     }
@@ -40,8 +41,8 @@ export const handler = async (event) => {
         console.error("Failed to retrieve parameters from DynamoDB: ", error);
         return returnStatusCode;
     }
-    if (!dbResponse.item) {
-        console.error("No item found in DynamoDB for key 'zoom-kit-parameters'");
+    if (!dbResponse.Item) {
+        console.error("No Item found in DynamoDB for key 'zoom-kit-parameters'");
         return returnStatusCode;
     }
     const webinarId = dbResponse.Item.webinarId;
@@ -52,7 +53,7 @@ export const handler = async (event) => {
         secretResponse = await client.send(
             new GetSecretValueCommand({ SecretId: "zoom-kit-integration/settings" })
         );
-        { zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString);
+        ({ zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString));
     } catch (error) {
         console.error("Failed to retrieve Zoom credentials from Secrets Manager: ", error);
         return returnStatusCode;
