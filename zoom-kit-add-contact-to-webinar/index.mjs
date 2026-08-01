@@ -39,11 +39,11 @@ export const handler = async (event) => {
         );
     } catch (error) {
         console.error("Failed to retrieve parameters from DynamoDB: ", error);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
     if (!dbResponse.Item) {
         console.error("No Item found in DynamoDB for key 'zoom-kit-parameters'");
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
     const webinarId = dbResponse.Item.webinarId;
 
@@ -56,12 +56,12 @@ export const handler = async (event) => {
         ({ zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString));
     } catch (error) {
         console.error("Failed to retrieve Zoom credentials from Secrets Manager: ", error);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
 
     if (!zoomClient || !zoomAccount) {
         console.error("Zoom credentials missing from Secrets Manager response");
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
 
     // Ask Zoom for an OAuth access token, valid for 1 hour
@@ -81,25 +81,22 @@ export const handler = async (event) => {
         tokenResponse = await fetchWithRetry("https://zoom.us/oauth/token", options);
     } catch (error) {
         console.error("Network error calling Zoom OAuth endpoint: ", error);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
 
     if (!tokenResponse.ok) {
         console.error(`Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
     
     const tokenData = await tokenResponse.json();
     const accessToken = tokenData.access_token;
     if (!accessToken) {
         console.error("Zoom OAuth response did not contain an access token:", tokenData);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
 
-    console.log(event.subscriber.email_address);
-    console.log(subscriberNames[0]);
-    console.log(subscriberNames[1]);
- 
+    // Register event subscriber with Zoom meeting/webinar
     options = {
         method: "POST",
         headers: {
@@ -118,12 +115,12 @@ export const handler = async (event) => {
         meetingsResponse = await fetchWithRetry(`https://api.zoom.us/v2/meetings/${webinarId}/registrants`, options);    
     } catch (error) {
         console.error("Network error calling Zoom registrants endpoint: ", error);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
 
     if (!meetingsResponse.ok) {
-        console.error(`Zoom add registrant to meeting/webinar request failed with status ${meetingsResponse.status}`);
-        return returnStatusCode;
+        console.error(`Zoom add registrant to meeting/webinar request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`);
+        return {statusCode: returnStatusCode};
     }
     
     const meetingData = await meetingsResponse.json();
@@ -131,7 +128,7 @@ export const handler = async (event) => {
 
     if (!joinURL) {
         console.error("Zoom add registrant response did not contain a join URL:", meetingData);
-        return returnStatusCode;
+        return {statusCode: returnStatusCode};
     }
 
     // Send the joinURL to Kit to store in the correct custom field:
@@ -139,7 +136,7 @@ export const handler = async (event) => {
     const { zkiKitKey: kitKey } = JSON.parse(secretResponse.SecretString);
     // Fetch the Kit custom field from the DynamoDB response
     const kitJoinURLField = dbResponse.Item.kitJoinURLField;
-    await fetch(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, {
+    options = {
         method: "PUT",
         headers: {
             "Accept": "application/json",
@@ -151,9 +148,24 @@ export const handler = async (event) => {
                 [kitJoinURLField]: joinURL,
             }
         }),
-    });
- 
-    // TODO Return something more sensible
+    };
+    let kitResponse;
+    try {
+        kitResponse = await fetchWithRetry(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, options);
+    } catch (error) {
+        console.error("Network error calling Kit update subscriber custom field endpoint: ", error);
+        return {statusCode: returnStatusCode};
+    }
+
+    if (!kitResponse.ok) {
+        console.error(`Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`);
+        // If all timeout retries have failed, kitResponse.status is 429 - for now, return 429 status code to Kit. 
+        // TODO: return 503 (service unavailable) to Kit, with a Retry-After header, so that Kit will retry the webhook.
+        // Otherwise just return 200 to Kit, even if there was a failure, so Kit doesn't disable the webhook rule.
+        return {statusCode: kitResponse.status === 429 ? 429 : 200};
+    }
+
+    // Everything really did work!
     return {
         statusCode: 200,
     };
