@@ -28,7 +28,7 @@ export const handler = async (event) => {
     if (subscriberNames[1] === '') {
         subscriberNames[1] = "-";
     }
-    // Fetch the webinar ID from DynamoDB
+    // Fetch the meeting/webinar option and ID from DynamoDB
     let dbResponse;
     try {
         dbResponse = await docClient.send(
@@ -45,7 +45,8 @@ export const handler = async (event) => {
         console.error("No Item found in DynamoDB for key 'zoom-kit-parameters'");
         return {statusCode: returnStatusCode};
     }
-    const webinarId = dbResponse.Item.webinarId;
+    const meetingOrWebinar = dbResponse.Item.meetingOrWebinar;
+    const webinarId = dbResponse.Item.webinarId; //This ID number represents either a meeting or a webinar!
 
     // Retrieve the Zoom credentials from Secrets Manager
     let secretResponse, zoomClient, zoomAccount;
@@ -112,7 +113,8 @@ export const handler = async (event) => {
     };
     let meetingsResponse;
     try {
-        meetingsResponse = await fetchWithRetry(`https://api.zoom.us/v2/meetings/${webinarId}/registrants`, options);    
+        // Zoom API URL contains "/meetings/" if registering for a meeting, or "/webinars/" if registering for a webinar
+        meetingsResponse = await fetchWithRetry(`https://api.zoom.us/v2/${meetingOrWebinar}s/${webinarId}/registrants`, options);    
     } catch (error) {
         console.error("Network error calling Zoom registrants endpoint: ", error);
         return {statusCode: returnStatusCode};
