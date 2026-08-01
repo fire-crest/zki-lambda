@@ -6,6 +6,14 @@ const client = new SecretsManagerClient();
 const dynamoClient = new DynamoDBClient();
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
+/* This function is designed to be called from a webhook in a Kit rule.
+   It's a good idea to always return 200 (success) because Kit will disable a webhook rule
+   if it fails too frequently.
+   Kit support aren't clear about the exact definition of "fails too frequently" but this 
+   has happened in production. Contact jo@redkite.biz for more information!
+   Better to alert admin if the function fails.
+*/
+const returnStatusCode = 200;
 
 export const handler = async (event) => {
     
@@ -20,19 +28,40 @@ export const handler = async (event) => {
         subscriberNames[1] = "-";
     }
     // Fetch the webinar ID from DynamoDB
-    const settingsResponse = await docClient.send(
-        new GetCommand({
-            TableName: "zoom-kit-parameters",
-            Key: { settingID: "zoom-kit-parameters" },
+    let dbResponse;
+    try {
+        dbResponse = await docClient.send(
+            new GetCommand({
+                TableName: "zoom-kit-parameters",
+                Key: { settingID: "zoom-kit-parameters" },
             })
-    );
-    const webinarId = settingsResponse.Item.webinarId;
+        );
+    } catch (error) {
+        console.error("Failed to retrieve parameters from DynamoDB: ", error);
+        return returnStatusCode;
+    }
+    if (!dbResponse.item) {
+        console.error("No item found in DynamoDB for key 'zoom-kit-parameters'");
+        return returnStatusCode;
+    }
+    const webinarId = dbResponse.Item.webinarId;
 
     // Retrieve the Zoom credentials from Secrets Manager
-    const secretResponse = await client.send(
-        new GetSecretValueCommand({ SecretId: "zoom-kit-integration/settings" })
-    );
-    const { zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString);
+    let secretResponse, zoomClient, zoomAccount;
+    try {
+        secretResponse = await client.send(
+            new GetSecretValueCommand({ SecretId: "zoom-kit-integration/settings" })
+        );
+        { zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString);
+    } catch (error) {
+        console.error("Failed to retrieve Zoom credentials from Secrets Manager: ", error);
+        return returnStatusCode;
+    }
+
+    if (!zoomClient || !zoomAccount) {
+        console.error("Zoom credentials missing from Secrets Manager response");
+        return returnStatusCode;
+    }
 
     // Ask Zoom for an OAuth access token, valid for 1 hour
     const tokenResponse = await fetch("https://zoom.us/oauth/token", {
@@ -77,7 +106,7 @@ export const handler = async (event) => {
     // Retrieve the Kit credentials from the Secrets Manager response
     const { zkiKitKey: kitKey } = JSON.parse(secretResponse.SecretString);
     // Fetch the Kit custom field from the DynamoDB response
-    const kitJoinURLField = settingsResponse.Item.kitJoinURLField;
+    const kitJoinURLField = dbResponse.Item.kitJoinURLField;
     //console.log(kitJoinURLField);
     //console.log(meetingData.join_url);
     await fetch(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, {
