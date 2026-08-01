@@ -65,22 +65,35 @@ export const handler = async (event) => {
     }
 
     // Ask Zoom for an OAuth access token, valid for 1 hour
-    const tokenResponse = await fetch("https://zoom.us/oauth/token", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": `Basic ${zoomClient}`,
-        },
-        body: new URLSearchParams({
-            grant_type: "account_credentials",
-            account_id: zoomAccount,
-        }),
-    });
+    let tokenResponse;
+    try {
+        tokenResponse = await fetch("https://zoom.us/oauth/token", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": `Basic ${zoomClient}`,
+            },
+            body: new URLSearchParams({
+                grant_type: "account_credentials",
+                account_id: zoomAccount,
+            }),
+        });
+    } catch (error) {
+        console.error("Network error calling Zoom OAuth endpoint: ", error);
+        return returnStatusCode;
+    }
 
+    if (!tokenResponse.ok) {
+        console.error(`Zoom OAuth token request failed with status ${tokenResponse.status}`);
+        return returnStatusCode;
+    }
+    
     const tokenData = await tokenResponse.json();
-    // TODO Handle failure case
-    // Assume it worked...
     const accessToken = tokenData.access_token;
+    if (!accessToken) {
+        console.error("Zoom OAuth response did not contain an access token:", tokenData);
+        return returnStatusCode;
+    }
 
     console.log(event.subscriber.email_address);
     console.log(subscriberNames[0]);
