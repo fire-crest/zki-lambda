@@ -3,27 +3,27 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 
-const client = new SecretsManagerClient();
-const dynamoClient = new DynamoDBClient();
-const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const secretsClient = new SecretsManagerClient();
+const dbClient = DynamoDBDocumentClient.from(new DynamoDBClient());
 const snsClient = new SNSClient();
 const FAILURE_TOPIC_ARN = process.env.FAILURE_TOPIC_ARN;
 
 /* This function is designed to be called from a webhook in a Kit rule.
-   Always return 200 (success), even if the function fails, because Kit will disable a webhook rule
-   if it fails too frequently.
-   Kit support aren't clear about the exact definition of "fails too frequently" but this 
-   has happened in production. 
+   In the case of internal failures (DynamoDB, Secrets Manager, non-rate-limit API errors) always return 200,
+   since Kit disables a webhook rule after too many failures (we definitely do not want that to happen)
+   and there's nothing Kit can usefully do differently in these cases. 
+   Failures are reported to admin via SNS email instead. 
+   The exception is a 429 from Zoom's or Kit's own API's even after retries are exhausted in fetchWithRetry(),
+   in which case return 503 back to Kit as a throttle signal. 
    Contact jo@redkite.biz for more information!
-   TODO: Better to alert admin if the function fails.
 */
-const returnStatusCode = 200;
+const successStatusCode = 200;
+const dbFailEmailSubject = "Zoom-Kit: DynamoDB failure";
+const secretsFailEmailSubject = "Zoom-Kit: Secrets Manager failure";
+const zoomFailEmailSubject = "Zoom-Kit: Zoom API failure";
+const kitFailEmailSubject = "Zoom-Kit: Kit API failure";
 
 export const handler = async (event) => {
-    const dbFailEmailSubject = "Zoom-Kit: DynamoDB failure";
-    const secretsFailEmailSubject = "Zoom-Kit: Secrets Manager failure";
-    const zoomFailEmailSubject = "Zoom-Kit: Zoom API failure";
-    const kitFailEmailSubject = "Zoom-Kit: Kit API failure";
 
     // Extract subscriber info from event
     const subscriberEmail = event.subscriber.email_address;
@@ -40,7 +40,7 @@ export const handler = async (event) => {
     // Fetch the meeting/webinar option and ID from DynamoDB
     let dbResponse;
     try {
-        dbResponse = await docClient.send(
+        dbResponse = await dbClient.send(
             new GetCommand({
                 TableName: "zoom-kit-parameters",
                 Key: { settingID: "zoom-kit-parameters" },
@@ -48,11 +48,11 @@ export const handler = async (event) => {
         );
     } catch (error) {
         await notifyFailure(dbFailEmailSubject, `Failed to retrieve parameters from DynamoDB: ${error}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
     if (!dbResponse.Item) {
         await notifyFailure(dbFailEmailSubject, "No Item found in DynamoDB for key 'zoom-kit-parameters'", subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
     const meetingOrWebinar = dbResponse.Item.meetingOrWebinar;
     const webinarId = dbResponse.Item.webinarId; //This ID number represents either a meeting or a webinar!
@@ -60,18 +60,18 @@ export const handler = async (event) => {
     // Retrieve the Zoom credentials from Secrets Manager
     let secretResponse, zoomClient, zoomAccount;
     try {
-        secretResponse = await client.send(
+        secretResponse = await secretsClient.send(
             new GetSecretValueCommand({ SecretId: "zoom-kit-integration/settings" })
         );
         ({ zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString));
     } catch (error) {
         await notifyFailure(secretsFailEmailSubject, `Failed to retrieve Zoom credentials from Secrets Manager: ${error}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
 
     if (!zoomClient || !zoomAccount) {
         await notifyFailure(secretsFailEmailSubject, "Zoom credentials missing from Secrets Manager response", subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
 
     // Ask Zoom for an OAuth access token, valid for 1 hour
@@ -91,19 +91,19 @@ export const handler = async (event) => {
         tokenResponse = await fetchWithRetry("https://zoom.us/oauth/token", options);
     } catch (error) {
         await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom OAuth endpoint: ${error}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return throttleAwareResponse(tokenResponse);
     }
 
     if (!tokenResponse.ok) {
         await notifyFailure(zoomFailEmailSubject, `Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
     
     const tokenData = await tokenResponse.json();
     const accessToken = tokenData.access_token;
     if (!accessToken) {
         await notifyFailure(zoomFailEmailSubject, `Zoom OAuth response did not contain an access token: ${tokenData}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
 
     // Register event subscriber with Zoom meeting/webinar
@@ -126,12 +126,12 @@ export const handler = async (event) => {
         meetingsResponse = await fetchWithRetry(`https://api.zoom.us/v2/${meetingOrWebinar}s/${webinarId}/registrants`, options);    
     } catch (error) {
         await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom registrants endpoint: ${error}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
 
     if (!meetingsResponse.ok) {
         await notifyFailure(zoomFailEmailSubject, `Zoom add registrant to ${meetingOrWebinar} request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return throttleAwareResponse(meetingsResponse);
     }
     
     const meetingData = await meetingsResponse.json();
@@ -139,7 +139,7 @@ export const handler = async (event) => {
 
     if (!joinURL) {
         await notifyFailure(zoomFailEmailSubject, `Zoom add registrant response did not contain a join URL: ${meetingData}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
 
     // Send the joinURL to Kit to store in the correct custom field:
@@ -165,15 +165,12 @@ export const handler = async (event) => {
         kitResponse = await fetchWithRetry(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, options);
     } catch (error) {
         await notifyFailure(kitFailEmailSubject, `Network error calling Kit update subscriber custom field endpoint for subscriber ${event.subscriber.id}: ${error}`, subscriberEmail, subscriberNames);
-        return {statusCode: returnStatusCode};
+        return {statusCode: successStatusCode};
     }
 
     if (!kitResponse.ok) {
         await notifyFailure(kitFailEmailSubject, `Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`, subscriberEmail, subscriberNames);
-        // If all timeout retries have failed, kitResponse.status is 429 - for now, return 429 status code to Kit. 
-        // TODO: return 503 (service unavailable) to Kit, with a Retry-After header, so that Kit will retry the webhook.
-        // Otherwise just return 200 to Kit, even if there was a failure, so Kit doesn't disable the webhook rule.
-        return {statusCode: kitResponse.status === 429 ? 429 : 200};
+        return throttleAwareResponse(kitResponse);
     }
 
     // Everything really did work!
@@ -232,6 +229,29 @@ async function fetchWithRetry(url, options, maxRetries = 2, waitMs = 15000) {
     }
 
     return response;
+}
+
+/**
+ * Decide what to return to the calling Kit webhook after a downstream call has failed.
+ * If the failure was a 429 (rate limited, even after retries), ask Kit to back off and
+ * retry later via a 503 response with a Retry-After header, as per Kit's API documentation.
+ * Otherwise, return 200 regardless of the failure, since Kit disables a webhook rule after
+ * too many non-2xx responses, and there's nothing useful Kit can do differently for an
+ * internal failure that isn't rate-limiting related.
+ * 
+ * TODO: Retry-After would be better as a configurable setting, rather than hard-coded at 60 seconds
+ */
+function throttleAwareResponse(response) {
+    if (response && response.status === 429) {
+        return {
+            statusCode: 503,
+            headers: {
+                "Retry-After": "60",
+            },
+            body: JSON.stringify({ response: "Service temporarily unavailable, please retry later" }),
+        };
+    }
+    return { statusCode: successStatusCode };
 }
 
 /**
