@@ -1,10 +1,13 @@
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 
 const client = new SecretsManagerClient();
 const dynamoClient = new DynamoDBClient();
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const snsClient = new SNSClient();
+const FAILURE_TOPIC_ARN = process.env.FAILURE_TOPIC_ARN;
 
 /* This function is designed to be called from a webhook in a Kit rule.
    Always return 200 (success), even if the function fails, because Kit will disable a webhook rule
@@ -17,8 +20,13 @@ const docClient = DynamoDBDocumentClient.from(dynamoClient);
 const returnStatusCode = 200;
 
 export const handler = async (event) => {
-    
+    const dbFailEmailSubject = "Zoom-Kit: DynamoDB failure";
+    const secretsFailEmailSubject = "Zoom-Kit: Secrets Manager failure";
+    const zoomFailEmailSubject = "Zoom-Kit: Zoom API failure";
+    const kitFailEmailSubject = "Zoom-Kit: Kit API failure";
+
     // Extract subscriber info from event
+    const subscriberEmail = event.subscriber.email_address;
     const subscriberNames = splitName(event.subscriber.first_name);
  	
 	// Zoom will reject empty name fields
@@ -28,6 +36,7 @@ export const handler = async (event) => {
     if (subscriberNames[1] === '') {
         subscriberNames[1] = "-";
     }
+
     // Fetch the meeting/webinar option and ID from DynamoDB
     let dbResponse;
     try {
@@ -38,11 +47,11 @@ export const handler = async (event) => {
             })
         );
     } catch (error) {
-        console.error("Failed to retrieve parameters from DynamoDB: ", error);
+        await notifyFailure(dbFailEmailSubject, `Failed to retrieve parameters from DynamoDB: ${error}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
     if (!dbResponse.Item) {
-        console.error("No Item found in DynamoDB for key 'zoom-kit-parameters'");
+        await notifyFailure(dbFailEmailSubject, "No Item found in DynamoDB for key 'zoom-kit-parameters'", subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
     const meetingOrWebinar = dbResponse.Item.meetingOrWebinar;
@@ -56,12 +65,12 @@ export const handler = async (event) => {
         );
         ({ zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString));
     } catch (error) {
-        console.error("Failed to retrieve Zoom credentials from Secrets Manager: ", error);
+        await notifyFailure(secretsFailEmailSubject, `Failed to retrieve Zoom credentials from Secrets Manager: ${error}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
     if (!zoomClient || !zoomAccount) {
-        console.error("Zoom credentials missing from Secrets Manager response");
+        await notifyFailure(secretsFailEmailSubject, "Zoom credentials missing from Secrets Manager response", subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
@@ -81,19 +90,19 @@ export const handler = async (event) => {
     try {
         tokenResponse = await fetchWithRetry("https://zoom.us/oauth/token", options);
     } catch (error) {
-        console.error("Network error calling Zoom OAuth endpoint: ", error);
+        await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom OAuth endpoint: ${error}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
     if (!tokenResponse.ok) {
-        console.error(`Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`);
+        await notifyFailure(zoomFailEmailSubject, `Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
     
     const tokenData = await tokenResponse.json();
     const accessToken = tokenData.access_token;
     if (!accessToken) {
-        console.error("Zoom OAuth response did not contain an access token:", tokenData);
+        await notifyFailure(zoomFailEmailSubject, `Zoom OAuth response did not contain an access token: ${tokenData}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
@@ -106,7 +115,7 @@ export const handler = async (event) => {
             "Authorization": `Bearer ${accessToken}`,
         },
         body: JSON.stringify({
-            email: event.subscriber.email_address,
+            email: subscriberEmail,
             first_name: subscriberNames[0],
             last_name: subscriberNames[1],
         }),
@@ -116,12 +125,12 @@ export const handler = async (event) => {
         // Zoom API URL contains "/meetings/" if registering for a meeting, or "/webinars/" if registering for a webinar
         meetingsResponse = await fetchWithRetry(`https://api.zoom.us/v2/${meetingOrWebinar}s/${webinarId}/registrants`, options);    
     } catch (error) {
-        console.error("Network error calling Zoom registrants endpoint: ", error);
+        await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom registrants endpoint: ${error}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
     if (!meetingsResponse.ok) {
-        console.error(`Zoom add registrant to meeting/webinar request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`);
+        await notifyFailure(zoomFailEmailSubject, `Zoom add registrant to ${meetingOrWebinar} request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
     
@@ -129,7 +138,7 @@ export const handler = async (event) => {
     const joinURL = meetingData.join_url;
 
     if (!joinURL) {
-        console.error("Zoom add registrant response did not contain a join URL:", meetingData);
+        await notifyFailure(zoomFailEmailSubject, `Zoom add registrant response did not contain a join URL: ${meetingData}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
@@ -155,12 +164,12 @@ export const handler = async (event) => {
     try {
         kitResponse = await fetchWithRetry(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, options);
     } catch (error) {
-        console.error("Network error calling Kit update subscriber custom field endpoint: ", error);
+        await notifyFailure(kitFailEmailSubject, `Network error calling Kit update subscriber custom field endpoint for subscriber ${event.subscriber.id}: ${error}`, subscriberEmail, subscriberNames);
         return {statusCode: returnStatusCode};
     }
 
     if (!kitResponse.ok) {
-        console.error(`Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`);
+        await notifyFailure(kitFailEmailSubject, `Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`, subscriberEmail, subscriberNames);
         // If all timeout retries have failed, kitResponse.status is 429 - for now, return 429 status code to Kit. 
         // TODO: return 503 (service unavailable) to Kit, with a Retry-After header, so that Kit will retry the webhook.
         // Otherwise just return 200 to Kit, even if there was a failure, so Kit doesn't disable the webhook rule.
@@ -223,4 +232,21 @@ async function fetchWithRetry(url, options, maxRetries = 2, waitMs = 15000) {
     }
 
     return response;
+}
+
+/**
+ * Send email via SNS when a Zoom or Kit API call fails, or Lambda function fails
+ */
+async function notifyFailure(subject, message, subscriberEmail, subscriberNames) {
+    message += ` while attempting to register ${subscriberNames[0]} ${subscriberNames[1]} ${subscriberEmail}`; 
+    console.error(message);
+    try {
+        await snsClient.send(new PublishCommand({
+            TopicArn: FAILURE_TOPIC_ARN,
+            Subject: subject,
+            Message: message,
+        }));
+    } catch (error) {
+        console.error("Failed to publish SNS notification:", error);
+    }
 }
