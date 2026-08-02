@@ -91,12 +91,12 @@ export const handler = async (event) => {
         tokenResponse = await fetchWithRetry("https://zoom.us/oauth/token", options);
     } catch (error) {
         await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom OAuth endpoint: ${error}`, subscriberEmail, subscriberNames);
-        return throttleAwareResponse(tokenResponse);
+        return {statusCode: successStatusCode};
     }
 
     if (!tokenResponse.ok) {
         await notifyFailure(zoomFailEmailSubject, `Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`, subscriberEmail, subscriberNames);
-        return {statusCode: successStatusCode};
+        return throttleAwareResponse(tokenResponse);
     }
     
     const tokenData = await tokenResponse.json();
