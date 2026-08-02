@@ -96,7 +96,7 @@ export const handler = async (event) => {
 
     if (!tokenResponse.ok) {
         await notifyFailure(zoomFailEmailSubject, `Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`, subscriberEmail, subscriberNames);
-        return throttleAwareResponse(tokenResponse);
+        return throttleAwareResponse(tokenResponse, "zoom");
     }
     
     const tokenData = await tokenResponse.json();
@@ -131,7 +131,7 @@ export const handler = async (event) => {
 
     if (!meetingsResponse.ok) {
         await notifyFailure(zoomFailEmailSubject, `Zoom add registrant to ${meetingOrWebinar} request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`, subscriberEmail, subscriberNames);
-        return throttleAwareResponse(meetingsResponse);
+        return throttleAwareResponse(meetingsResponse, "zoom");
     }
     
     const meetingData = await meetingsResponse.json();
@@ -170,7 +170,7 @@ export const handler = async (event) => {
 
     if (!kitResponse.ok) {
         await notifyFailure(kitFailEmailSubject, `Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`, subscriberEmail, subscriberNames);
-        return throttleAwareResponse(kitResponse);
+        return throttleAwareResponse(kitResponse, "kit");
     }
 
     // Everything really did work!
@@ -231,31 +231,50 @@ async function fetchWithRetry(url, options, maxRetries = 2, waitMs = 15000) {
     return response;
 }
 
+
 /**
  * Decide what to return to the calling Kit webhook after a downstream call has failed.
- * If the failure was a 429 (rate limited, even after retries), ask Kit to back off and
+ * If Kit itself failed with a 429 (rate limited, even after retries), ask Kit to back off and
  * retry later via a 503 response with a Retry-After header, as per Kit's API documentation.
- * Otherwise, return 200 regardless of the failure, since Kit disables a webhook rule after
- * too many non-2xx responses, and there's nothing useful Kit can do differently for an
- * internal failure that isn't rate-limiting related.
+ * 
+ * If Zoom failed with a 429, it may be that a per day limit or a per second limit has been 
+ * exceeded. Only the per second limit (QPS) is worth retrying, as it will clear next second. Check
+ * the x-ratelimit-type header to distinguish QPS from daily limits.
+ * 
+ * For any other failures, return 200 to Kit regardless of the failure code, since Kit disables a   
+ * webhook rule after too many non-2xx responses, and asking it to retry is unlikely to succeed.
+ * 
+ * All failures, including 429, have been reported via SNS in notifyFailure();
  * 
  * TODO: Retry-After would be better as a configurable setting, rather than hard-coded at 60 seconds
- */
-function throttleAwareResponse(response) {
+ *
+ * @param {Response} response The failed fetch Response object.
+ * @param {"zoom"|"kit"} service Which API the response came from.
+*/
+function throttleAwareResponse(response, service) {
     if (response && response.status === 429) {
-        return {
-            statusCode: 503,
-            headers: {
-                "Retry-After": "60",
-            },
-            body: JSON.stringify({ response: "Service temporarily unavailable, please retry later" }),
-        };
+        const isRetryable =
+            service === "kit" ||
+            response.headers?.get("x-ratelimit-type") === "QPS";
+
+        if (isRetryable) {
+            return {
+                statusCode: 503,
+                headers: {
+                    "Retry-After": "60",
+                },
+                body: JSON.stringify({ response: "Service temporarily unavailable, please retry later" }),
+            };
+        }
     }
+
+    // No point in requesting Kit to throttle - just return success
+    // (problem has been logged and reported to admin by email)
     return { statusCode: successStatusCode };
 }
 
 /**
- * Send email via SNS when a Zoom or Kit API call fails, or Lambda function fails
+ * Send email via SNS when a Zoom or Kit API call fails
  */
 async function notifyFailure(subject, message, subscriberEmail, subscriberNames) {
     message += ` while attempting to register ${subscriberNames[0]} ${subscriberNames[1]} ${subscriberEmail}`; 
