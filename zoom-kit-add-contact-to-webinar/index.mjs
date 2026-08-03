@@ -47,11 +47,13 @@ export const handler = async (event) => {
             })
         );
     } catch (error) {
-        await notifyFailure(dbFailEmailSubject, `Failed to retrieve parameters from DynamoDB: ${error}`, subscriberEmail, subscriberNames);
+        await notifyFailure(dbFailEmailSubject, `Failed to retrieve parameters from DynamoDB: ${error}`, 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
     if (!dbResponse.Item) {
-        await notifyFailure(dbFailEmailSubject, "No Item found in DynamoDB for key 'zoom-kit-parameters'", subscriberEmail, subscriberNames);
+        await notifyFailure(dbFailEmailSubject, "No Item found in DynamoDB for key 'zoom-kit-parameters'", 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
     const meetingOrWebinar = dbResponse.Item.meetingOrWebinar;
@@ -65,12 +67,14 @@ export const handler = async (event) => {
         );
         ({ zkiZoomClient: zoomClient, zkiZoomAccount: zoomAccount } = JSON.parse(secretResponse.SecretString));
     } catch (error) {
-        await notifyFailure(secretsFailEmailSubject, `Failed to retrieve Zoom credentials from Secrets Manager: ${error}`, subscriberEmail, subscriberNames);
+        await notifyFailure(secretsFailEmailSubject, `Failed to retrieve Zoom credentials from Secrets Manager: ${error}`, 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
     if (!zoomClient || !zoomAccount) {
-        await notifyFailure(secretsFailEmailSubject, "Zoom credentials missing from Secrets Manager response", subscriberEmail, subscriberNames);
+        await notifyFailure(secretsFailEmailSubject, "Zoom credentials missing from Secrets Manager response", 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
@@ -90,19 +94,24 @@ export const handler = async (event) => {
     try {
         tokenResponse = await fetchWithRetry("https://zoom.us/oauth/token", options);
     } catch (error) {
-        await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom OAuth endpoint: ${error}`, subscriberEmail, subscriberNames);
+        await notifyFailure(zoomFailEmailSubject, 
+            `Network error calling Zoom OAuth endpoint: ${error.message}${error.cause ? ` (cause: ${error.cause})` : ''}`, 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
     if (!tokenResponse.ok) {
-        await notifyFailure(zoomFailEmailSubject, `Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`, subscriberEmail, subscriberNames);
+        await notifyFailure(zoomFailEmailSubject, 
+            `Zoom OAuth token request failed with status ${tokenResponse.status} ${tokenResponse.statusText}`, 
+            subscriberEmail, subscriberNames, tokenResponse);
         return throttleAwareResponse(tokenResponse, "zoom");
     }
     
     const tokenData = await tokenResponse.json();
     const accessToken = tokenData.access_token;
     if (!accessToken) {
-        await notifyFailure(zoomFailEmailSubject, `Zoom OAuth response did not contain an access token: ${tokenData}`, subscriberEmail, subscriberNames);
+        await notifyFailure(zoomFailEmailSubject, 
+            `Zoom OAuth response did not contain an access token: ${tokenData}`, subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
@@ -125,12 +134,16 @@ export const handler = async (event) => {
         // Zoom API URL contains "/meetings/" if registering for a meeting, or "/webinars/" if registering for a webinar
         meetingsResponse = await fetchWithRetry(`https://api.zoom.us/v2/${meetingOrWebinar}s/${webinarId}/registrants`, options);    
     } catch (error) {
-        await notifyFailure(zoomFailEmailSubject, `Network error calling Zoom registrants endpoint: ${error}`, subscriberEmail, subscriberNames);
+        await notifyFailure(zoomFailEmailSubject, 
+            `Network error calling Zoom registrants endpoint: ${error}${error.cause ? ` (cause: ${error.cause})` : ''}`, 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
     if (!meetingsResponse.ok) {
-        await notifyFailure(zoomFailEmailSubject, `Zoom add registrant to ${meetingOrWebinar} request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`, subscriberEmail, subscriberNames);
+        await notifyFailure(zoomFailEmailSubject, 
+            `Zoom add registrant to ${meetingOrWebinar} request failed with status ${meetingsResponse.status} ${meetingsResponse.statusText}`, 
+            subscriberEmail, subscriberNames, meetingsResponse);
         return throttleAwareResponse(meetingsResponse, "zoom");
     }
     
@@ -138,7 +151,8 @@ export const handler = async (event) => {
     const joinURL = meetingData.join_url;
 
     if (!joinURL) {
-        await notifyFailure(zoomFailEmailSubject, `Zoom add registrant response did not contain a join URL: ${meetingData}`, subscriberEmail, subscriberNames);
+        await notifyFailure(zoomFailEmailSubject, 
+            `Zoom add registrant response did not contain a join URL: ${meetingData}`, subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
@@ -162,14 +176,19 @@ export const handler = async (event) => {
     };
     let kitResponse;
     try {
-        kitResponse = await fetchWithRetry(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, options);
+       kitResponse = await fetchWithRetry(`https://api.kit.com/v4/subscribers/${event.subscriber.id}`, options);
     } catch (error) {
-        await notifyFailure(kitFailEmailSubject, `Network error calling Kit update subscriber custom field endpoint for subscriber ${event.subscriber.id}: ${error}`, subscriberEmail, subscriberNames);
+        await notifyFailure(kitFailEmailSubject, 
+            `Network error calling Kit update subscriber custom field endpoint for 
+            subscriber ${event.subscriber.id}: ${error}${error.cause ? ` (cause: ${error.cause})` : ''}`, 
+            subscriberEmail, subscriberNames);
         return {statusCode: successStatusCode};
     }
 
     if (!kitResponse.ok) {
-        await notifyFailure(kitFailEmailSubject, `Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`, subscriberEmail, subscriberNames);
+        await notifyFailure(kitFailEmailSubject, 
+            `Kit update subscriber ${event.subscriber.id} with Zoom join URL failed with status ${kitResponse.status} ${kitResponse.statusText}`, 
+            subscriberEmail, subscriberNames, kitResponse);
         return throttleAwareResponse(kitResponse, "kit");
     }
 
@@ -274,10 +293,27 @@ function throttleAwareResponse(response, service) {
 }
 
 /**
- * Send email via SNS when a Zoom or Kit API call fails
+ * Send email via SNS when a Zoom or Kit API call fails.
+ * If the failed fetch Response is supplied, attempts to read its JSON body and append
+ * the API's own error code/message (e.g. Zoom's { code: 3001, message: "Meeting does not exist..." })
+ * to the notification.
  */
-async function notifyFailure(subject, message, subscriberEmail, subscriberNames) {
-    message += ` while attempting to register ${subscriberNames[0]} ${subscriberNames[1]} ${subscriberEmail}`; 
+async function notifyFailure(subject, message, subscriberEmail, subscriberNames, response = null) {
+    message += ` while attempting to register ${subscriberNames[0]} ${subscriberNames[1]} ${subscriberEmail}`;
+
+    if (response) {
+        try {
+            // Clone so the body stream is still available if anything else needs to read it
+            const errorBody = await response.clone().json();
+            if (errorBody && (errorBody.code !== undefined || errorBody.message !== undefined)) {
+                message += ` | API response: code ${errorBody.code}, message: ${errorBody.message}`;
+                message += ` | API response body: ${JSON.stringify(errorBody)}`;
+            }
+        } catch (error) {
+            // Response body wasn't JSON, or was empty - nothing useful to add
+        }
+    }
+
     console.error(message);
     try {
         await snsClient.send(new PublishCommand({
