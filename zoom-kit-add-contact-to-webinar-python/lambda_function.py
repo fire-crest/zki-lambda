@@ -69,7 +69,7 @@ def lambda_handler(event, context):
 
     meeting_or_webinar = item.get("meetingOrWebinar")
     webinar_id = item.get("webinarId")  # This ID number represents either a meeting or a webinar!
-
+ 
     # Retrieve the Zoom credentials from Secrets Manager
     try:
         secret_response = secrets_client.get_secret_value(SecretId="zoom-kit-integration/settings")
@@ -123,6 +123,7 @@ def lambda_handler(event, context):
             f"Zoom OAuth token request failed with status {token_response.status_code} {token_response.reason}",
             subscriber_email,
             subscriber_names,
+            token_response,
         )
         return throttle_aware_response(token_response, "zoom")
 
@@ -173,6 +174,7 @@ def lambda_handler(event, context):
             f"{meetings_response.status_code} {meetings_response.reason}",
             subscriber_email,
             subscriber_names,
+            meetings_response,
         )
         return throttle_aware_response(meetings_response, "zoom")
 
@@ -208,7 +210,8 @@ def lambda_handler(event, context):
     subscriber_id = event["subscriber"]["id"]
     try:
         kit_response = fetch_with_retry(
-            f"https://api.kit.com/v4/subscribers/{subscriber_id}",
+#            f"https://api.kit.com/v4/subscribers/{subscriber_id}",
+            f"https://api.kit.com/v4/subscribers/1234",
             method="PUT",
             headers=kit_headers,
             data=kit_body,
@@ -229,6 +232,7 @@ def lambda_handler(event, context):
             f"{kit_response.status_code} {kit_response.reason}",
             subscriber_email,
             subscriber_names,
+            kit_response,
         )
         return throttle_aware_response(kit_response, "kit")
 
@@ -328,11 +332,23 @@ def throttle_aware_response(response, service):
     return {"statusCode": SUCCESS_STATUS_CODE}
 
 
-def notify_failure(subject, message, subscriber_email, subscriber_names):
+def notify_failure(subject, message, subscriber_email, subscriber_names, response=None):
     """
     Send email via SNS when a Zoom or Kit API call fails
     """
     message = f"{message} while attempting to register {subscriber_names[0]} {subscriber_names[1]} {subscriber_email}"
+
+    if response is not None:
+        try:
+            error_body = response.json()
+            if error_body:
+                if (error_body.get('code') is not None or error_body.get('message') is not None):
+                    message += f" | API response: code {error_body.get('code')}, message: {error_body.get('message')}"
+                message += f" | API response body: {json.dumps(error_body)}"
+        except Exception:
+            # If the response body is not JSON, or empty, nothing to add to the message
+            pass
+
     logger.error(message)
     try:
         sns_client.publish(TopicArn=FAILURE_TOPIC_ARN, Subject=subject, Message=message)
