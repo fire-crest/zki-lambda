@@ -210,8 +210,7 @@ def lambda_handler(event, context):
     subscriber_id = event["subscriber"]["id"]
     try:
         kit_response = fetch_with_retry(
-#            f"https://api.kit.com/v4/subscribers/{subscriber_id}",
-            f"https://api.kit.com/v4/subscribers/1234",
+            f"https://api.kit.com/v4/subscribers/{subscriber_id}",
             method="PUT",
             headers=kit_headers,
             data=kit_body,
