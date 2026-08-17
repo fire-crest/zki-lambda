@@ -5,6 +5,38 @@ zoom-kit-add-contact-to-webinar (Node.js)
 and
 zoom-kit-add-contact-to-webinar-python (Python)
 
+```mermaid
+flowchart TD
+    subgraph KitBox["Kit"]
+        Rule["Automation Rule<br/>(webhook action)"]
+    end
+
+    subgraph AWS["AWS"]
+        Lambda["Lambda<br/>zoom-kit-integration"]
+        DDB[("DynamoDB<br/>zoom-kit-parameters")]
+        SM[("Secrets Manager<br/>zoom-kit-integration/settings")]
+        SNSTopic["SNS Topic<br/>failure notifications"]
+    end
+
+    subgraph ZoomBox["Zoom"]
+        ZoomOAuth["OAuth token<br/>zoom.us/oauth/token"]
+        ZoomAPI["Meetings/Webinars API<br/>add registrant"]
+    end
+
+    KitAPI["Kit API v4<br/>update subscriber"]
+    Admin["Admin<br/>(email)"]
+
+    Rule -->|"1. POST webhook<br/>(subscriber data)"| Lambda
+    Lambda -->|"2. get meeting/webinar settings"| DDB
+    Lambda -->|"3. get Zoom + Kit credentials"| SM
+    Lambda -->|"4. request access token"| ZoomOAuth
+    Lambda -->|"5. register subscriber"| ZoomAPI
+    Lambda -->|"6. store join URL"| KitAPI
+    Lambda -. "on failure: notify" .-> SNSTopic
+    SNSTopic -. "email" .-> Admin
+    Lambda -->|"7. response 200 / 503"| Rule
+```
+
 add_contact_to_webinar endpoint is triggered by an automated rule in Kit cms when a subscriber 
 fills a form requesting to join a Zoom webinar or meeting.
 
