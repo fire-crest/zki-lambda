@@ -3,6 +3,7 @@ node_modules/
 .env.local
 .aws/
 .DS_Store
+.vscode
 dist/
 build/
 vendor/
