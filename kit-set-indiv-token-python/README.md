@@ -1,6 +1,6 @@
 # kit-set-indiv-token (Python)
 
-Port of `kit_create_subscriber_token()`, endpoint `/djapp/v2/4UJ8lH9EtZ0D/`,
+Port of `kit_create_subscriber_token()`, endpoint `/zoom_kit_integration/v2/4UJ8lH9EtZ0D/`,
 from the WordPress plugin `zoom_kit_integration` to an AWS Lambda function.
 
 A Kit automation rule calls this function's webhook URL. The function saves a
@@ -85,7 +85,7 @@ Standard-tier parameters are free.
 
 ### 2. Create the function
 
-Lambda → Create function → Author from scratch:
+Lambda → Event functions → Author from scratch:
 
 - **Name:** `kit-set-indiv-token`
 - **Runtime:** **Python 3.13**
@@ -192,16 +192,15 @@ In Postman, POST to the webhook URL with this body:
 ```
 
 You should get `200 {"response": "OK"}` straight away. Within a few seconds,
-your `indiv_token` in Kit should show the new `ID.signature` format.
+your `indiv_token` in Kit should show the new format of about 35 random-looking characters.
 CloudWatch logs should show "Accepted subscriber..." and then "Saved indiv_token...".
 
 Then POST to the URL with the wrong key on the end. You should get `403`.
 
 ### 8. Point Kit at it
 
-Edit the Kit rule's webhook action:
-1. Replace the old `djapp.derekandjo.com/...` URL with the webhook URL from step 6.
-2. Switch the rule back on.
+Create a Kit webhook with the webhook URL from step 6.
+Disable any existing rules/webhooks that use the wordpress webhook.
 
 ### 9. Catch everyone up
 
@@ -236,8 +235,3 @@ Notes:
 **Use this script, not the Kit rule, for bulk changes.** Firing the rule for
 thousands of subscribers at once would hit Kit's rate limit faster than
 Lambda's retries can absorb.
-
-### 10. Tidy up
-
-Once this has run smoothly for a week or two, remove the `4UJ8lH9EtZ0D`
-endpoint from the WordPress plugin.
