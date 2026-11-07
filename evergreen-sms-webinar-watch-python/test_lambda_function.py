@@ -215,7 +215,7 @@ class JobTests(unittest.TestCase):
         self.marks = set()
         patchers = [mock.patch.object(fn, "settings", return_value=SECRETS),
                     mock.patch.object(fn, "notify_failure"),
-                    mock.patch.object(fn, "latest_registration", side_effect=lambda s: self.registration),
+                    mock.patch.object(fn, "latest_run_start", side_effect=lambda s: self.registration),
                     mock.patch.object(fn, "mark_pitch_counted", side_effect=self.fake_mark),
                     mock.patch.object(fn, "unmark_pitch_counted", side_effect=lambda s, r: self.marks.discard((s, r)))]
         self.settings, self.notify, self.latest, self.mark, self.unmark = [p.start() for p in patchers]
@@ -257,7 +257,7 @@ class JobTests(unittest.TestCase):
         self.run_job(kit)
         self.assertEqual(kit.fields[COUNT_FIELD], "8")
 
-    def test_rewatch_in_same_registration_not_counted_again(self):
+    def test_rewatch_in_same_run_not_counted_again(self):
         kit = FakeKit(count="4")
         self.run_job(kit)
         self.run_job(kit)  # re-watch, second tab or Lambda retry
@@ -265,21 +265,21 @@ class JobTests(unittest.TestCase):
         self.assertEqual([c[0] for c in kit.calls].count("POST"), 2)  # tag still added each time
         self.notify.assert_not_called()
 
-    def test_new_registration_counted_again(self):
+    def test_new_run_counted_again(self):
         kit = FakeKit(count="4")
         self.run_job(kit)
-        self.registration = "2026-01-05T09:00:00.000Z#def456"  # they registered again
+        self.registration = "2026-01-05T09:00:00.000Z#def456"  # a new run started
         self.run_job(kit)
         self.assertEqual(kit.fields[COUNT_FIELD], "6")
 
-    def test_no_registration_logged_tagged_not_counted_and_reported(self):
+    def test_no_run_logged_tagged_not_counted_and_reported(self):
         self.registration = None
         kit = FakeKit(count="4")
         self.run_job(kit)
         self.assertEqual(kit.calls, [("POST", f"tags/{WATCHED_TAG}/subscribers/{SUB}")])
         self.assertEqual(kit.fields[COUNT_FIELD], "4")
         self.notify.assert_called_once()
-        self.assertIn("no registration", self.notify.call_args.args[0])
+        self.assertIn("no run on record", self.notify.call_args.args[0])
 
     def test_kit_busy_on_count_unmarks_so_retry_counts(self):
         kit = FakeKit(count="4", fail={("PUT", "subscribers"): (429, "busy")})
@@ -357,29 +357,35 @@ class EventLogTests(unittest.TestCase):
         fn._clients.pop("table", None)
         self.addCleanup(fn._clients.pop, "table", None)
 
-    def put(self, subscriber_id, event_at, event):
-        fn.events_table().put_item(Item={"subscriber_id": subscriber_id, "event_at": event_at, "event": event})
+    def put(self, subscriber_id, event_at, event, new_run=None):
+        item = {"subscriber_id": subscriber_id, "event_at": event_at, "event": event}
+        if new_run is not None:
+            item["new_run"] = new_run
+        fn.events_table().put_item(Item=item)
 
-    def test_finds_latest_registration_among_other_events(self):
-        self.put(SUB, "2026-01-01T10:00:00.000Z#a", "registered")
+    def test_finds_start_of_latest_run_among_other_events(self):
+        self.put(SUB, "2026-01-01T10:00:00.000Z#a", "registered", True)
         self.put(SUB, "2026-01-01T10:05:00.000Z#b", "started")
-        self.put(SUB, "2026-01-03T09:00:00.000Z#c", "registered")
+        self.put(SUB, "2026-01-03T09:00:00.000Z#c", "registered", True)    # run 2 starts
         self.put(SUB, "2026-01-03T09:10:00.000Z#d", "progress")
-        self.put(SUB, "2026-01-03T10:15:00.000Z#e", "reached_pitch")
-        self.put("999", "2026-01-09T00:00:00.000Z#f", "registered")  # someone else
-        self.assertEqual(fn.latest_registration(SUB), "2026-01-03T09:00:00.000Z#c")
+        self.put(SUB, "2026-01-04T08:00:00.000Z#e", "registered", False)   # re-registered within run 2
+        self.put(SUB, "2026-01-04T09:00:00.000Z#g", "registered")          # older row with no new_run
+        self.put(SUB, "2026-01-04T10:15:00.000Z#h", "reached_pitch")
+        self.put("999", "2026-01-09T00:00:00.000Z#f", "registered", True)  # someone else
+        self.assertEqual(fn.latest_run_start(SUB), "2026-01-03T09:00:00.000Z#c")
 
     def test_finds_registration_behind_many_later_events(self):
         # Many progress rows after the registration: the search must page through them
-        self.put(SUB, "2026-01-01T10:00:00.000Z#reg", "registered")
+        self.put(SUB, "2026-01-01T10:00:00.000Z#reg", "registered", True)
         for i in range(300):
             self.put(SUB, f"2026-01-01T11:{i // 60:02d}:{i % 60:02d}.000Z#{i:03d}", "progress")
-        self.assertEqual(fn.latest_registration(SUB), "2026-01-01T10:00:00.000Z#reg")
+        self.assertEqual(fn.latest_run_start(SUB), "2026-01-01T10:00:00.000Z#reg")
 
-    def test_no_registration(self):
+    def test_no_run(self):
         self.put(SUB, "2026-01-01T10:05:00.000Z#b", "started")
-        self.assertIsNone(fn.latest_registration(SUB))
-        self.assertIsNone(fn.latest_registration("555"))
+        self.put(SUB, "2026-01-01T10:00:00.000Z#a", "registered", False)  # only an in-window re-registration
+        self.assertIsNone(fn.latest_run_start(SUB))
+        self.assertIsNone(fn.latest_run_start("555"))
 
     def test_first_mark_wins_and_unmark_reopens(self):
         self.put(SUB, REGISTRATION, "registered")

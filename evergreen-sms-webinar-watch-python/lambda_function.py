@@ -18,16 +18,21 @@ so it can never apply sms-member or anything else.
   started        log it, then tag <started-tag-id>
   progress       log it (with the minute) - never calls Kit
   reached_pitch  log it, then tag <watched-tag-id> and add 1 to <watch-count-field>,
-                 once per registration (see below)
+                 once per run (see below)
 
-The watch count means "how many registrations they watched to the pitch".
-Every reached_pitch is logged, re-watches included, but the count only goes
-up once per registration: the job finds the subscriber's latest 'registered'
-row and marks it pitch_counted_at. DynamoDB accepts only the first mark, so a
-re-watch, a second tab or a retried job can't count twice. If Kit then fails
-in a way worth retrying, the mark is removed so the retry can count it.
-Someone with no registration on record is logged and tagged but not counted,
-and admin is emailed.
+A "run" is one watch-and-purchase window. It starts with a registration made
+while no window was open; evergreen-sms-webinar-registration marks that
+'registered' row new_run = true. Re-registering while a window is open doesn't
+start a new run.
+
+The watch count means "how many runs they watched to the pitch", so it can
+never exceed the registration count. Every reached_pitch is logged, re-watches
+included, but the count only goes up once per run: the job finds the latest
+'registered' row with new_run = true and marks it pitch_counted_at. DynamoDB
+accepts only the first mark, so a re-watch during the cart window, a second tab
+or a retried job can't count twice. If Kit then fails in a way worth retrying,
+the mark is removed so the retry can count it. Someone with no run on record
+is logged and tagged but not counted, and admin is emailed.
 
 How it works - the function runs in two modes:
 
@@ -38,7 +43,7 @@ How it works - the function runs in two modes:
    the page and can't lose a milestone.
 
 2. JOB MODE (the background run)
-   Applies the milestone's tags and, once per registration, increments the watch count in Kit. If Kit is
+   Applies the milestone's tags and, once per run, increments the watch count in Kit. If Kit is
    busy (429) or broken (5xx), or the network fails, the job raises an error and
    Lambda retries it automatically. If every retry fails, Lambda sends the failed
    job to the "on failure" SNS destination, which emails admin.
@@ -259,18 +264,18 @@ def run_kit_actions(subscriber_id, milestone):
 
     # Count last, so a retry caused by a tag failure can't count twice
     if actions["increment"]:
-        count_once_per_registration(subscriber_id, actions["increment"], cfg["kit_api_key"])
+        count_once_per_run(subscriber_id, actions["increment"], cfg["kit_api_key"])
 
 
-def count_once_per_registration(subscriber_id, field, api_key):
-    """Add 1 to the watch count, unless this subscriber's latest registration has already been counted."""
-    registration = latest_registration(subscriber_id)  # a DynamoDB error here makes Lambda retry
+def count_once_per_run(subscriber_id, field, api_key):
+    """Add 1 to the watch count, unless this subscriber's current run has already been counted."""
+    registration = latest_run_start(subscriber_id)  # a DynamoDB error here makes Lambda retry
     if registration is None:
-        notify_failure(f"Subscriber {subscriber_id} reached the pitch with no registration on record. "
-                       f"Logged and tagged, but {field} was not increased.")
+        notify_failure(f"Subscriber {subscriber_id} reached the pitch with no run on record (no registration "
+                       f"that started a watch-and-purchase window). Logged and tagged, but {field} was not increased.")
         return
     if not mark_pitch_counted(subscriber_id, registration):
-        logger.info("Registration %s for subscriber %s already counted for %s", registration, subscriber_id, field)
+        logger.info("Run starting %s for subscriber %s already counted for %s", registration, subscriber_id, field)
         return
     try:
         increment_field(subscriber_id, field, api_key)
@@ -279,11 +284,11 @@ def count_once_per_registration(subscriber_id, field, api_key):
         raise
 
 
-def latest_registration(subscriber_id):
-    """Return the event_at of the subscriber's most recent 'registered' row, or None if there isn't one."""
+def latest_run_start(subscriber_id):
+    """Return the event_at of the 'registered' row that started the subscriber's latest run, or None."""
     query = {
         "KeyConditionExpression": Key("subscriber_id").eq(subscriber_id),
-        "FilterExpression": Attr("event").eq("registered"),
+        "FilterExpression": Attr("event").eq("registered") & Attr("new_run").eq(True),
         "ProjectionExpression": "event_at",
         "ScanIndexForward": False,  # newest first
     }

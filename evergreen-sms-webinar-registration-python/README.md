@@ -16,8 +16,8 @@ flowchart TD
     Fn -->|"2. write 'registered' row"| DB
     Fn -->|"3. reply 200"| Hook
     Fn -->|"4. start background run"| Job
-    Job -->|"5a. token, if missing<br/>5b. count +1, once<br/>5c. token-ready tag"| Kit["Kit API v4"]
-    Job -->|"mark registration counted"| DB
+    Job -->|"5a. token, if missing<br/>5b. window open? count +1 if not<br/>5c. token-ready tag"| Kit["Kit API v4"]
+    Job -->|"record new_run,<br/>mark counted"| DB
     Job -. "Kit busy: automatic retries<br/>still failing: email" .-> SNS
 ```
 
@@ -28,13 +28,28 @@ flowchart TD
 2. **In the background, in this order:**
    1. **Token:** if the subscriber's token is missing or invalid, a correct one
       is created and saved. A valid existing token is never changed.
-   2. **Registration count:** +1, **once per registration**. The job first marks
-      that registration's row as counted (`counted_at`). DynamoDB accepts only
-      the first mark, so a retry can't count twice. If Kit then fails in a way
-      worth retrying, the mark is removed so the retry can count it.
-   3. **Token-ready tag:** added last, because it releases the confirmation
-      email, so the token is always saved first. If the token couldn't be
-      saved, the tag isn't added and admin is emailed.
+   2. **New run?** The job reads the subscriber's tags in Kit. If they have the
+      watch-window or cart-window tag, a watch-and-purchase window is already
+      open: the row is marked `new_run = false` and nothing is counted. If
+      not, this registration **starts a new run**: the row is marked
+      `new_run = true` and the registration count goes up by 1.
+      - `new_run` is recorded only once, so a retry an hour later can't change
+        the decision after the windows have moved on.
+      - If Kit's tag list can't be read, the job retries rather than guessing.
+      - Counting uses a `counted_at` mark on the row. DynamoDB accepts only the
+        first mark, so a retry can't count twice. If Kit then fails in a way
+        worth retrying, the mark is removed so the retry can count it.
+   3. **Token-ready tag:** added last, every time, because it releases the
+      confirmation email (the registration automation decides what to send).
+      Being last also means step 2 sees the window tags as they were *before*
+      this registration, since the automation that resets windows starts on
+      this tag. If the token couldn't be saved, the tag isn't added and admin
+      is emailed.
+
+**The registration count** therefore means "how many watch-and-purchase runs
+they've started". Re-registering while a window is open is logged but not
+counted. `evergreen-sms-webinar-watch` counts at most one watch per run, so the
+watch count can never exceed the registration count.
 
 Not yet included: UTMs on the `registered` row (a later step, once the page
 script that passes them to the form exists), and the Kajabi contact (waits on
@@ -50,7 +65,9 @@ The same `evergreen_events` table as `evergreen-sms-webinar-watch`:
 | `event_at` | `2026-11-06T19:40:12.345Z#a1b2c3` | sort key |
 | `event` | `registered` | |
 | `source` | `kit_form` | |
-| `counted_at` | `2026-11-06T19:40:13.002+00:00` | added once the registration count has been increased |
+| `new_run` | `true` | `true` if this registration started a new run (no window open), `false` if a window was already open |
+| `counted_at` | `2026-11-06T19:40:13.002+00:00` | added once the registration count has been increased (new runs only) |
+| `pitch_counted_at` | `2026-11-06T21:02:44.120+00:00` | added by `evergreen-sms-webinar-watch` once this run's watch has been counted |
 
 No email addresses are stored.
 
@@ -81,6 +98,8 @@ Create these in **Systems Manager → Parameter Store**, all **Tier: Standard**:
 | `/zki/evergreen-registration/token-field` | String | Key of the Kit custom field holding the token |
 | `/zki/evergreen-registration/registration-count-field` | String | Key of the Kit custom field for the registration count |
 | `/zki/evergreen-registration/token-ready-tag-id` | String | ID of the Kit tag that releases the confirmation email |
+| `/zki/evergreen-registration/watch-window-tag-id` | String | ID of the Kit tag meaning "watch window open" |
+| `/zki/evergreen-registration/cart-window-tag-id` | String | ID of the Kit tag meaning "cart window open" |
 
 Make the webhook key with:
 
@@ -181,14 +200,20 @@ Pick a test subscriber and note their registration count. POST to the webhook UR
 { "subscriber": { "id": "TEST_SUBSCRIBER_ID" } }
 ```
 
-Expect `200`. Within a few seconds:
-- a `registered` row for them in `evergreen_events`, with `counted_at` set,
+Make sure they have **neither** window tag. Expect `200`. Within a few seconds:
+- a `registered` row for them in `evergreen_events`, with `new_run` true and `counted_at` set,
 - their registration count up by 1,
 - the token-ready tag added,
 - their token unchanged if they already had one.
 
-Send it again: a **second** row, and the count up by 1 again. Then send it to
-the URL with one character of the key changed: `403`, and no new row.
+**Window open.** Add the watch-window tag to them by hand, and send it again: a
+**second** row with `new_run` false, the count **unchanged**, and the
+token-ready tag still added. Repeat with the cart-window tag instead: the same.
+
+**Window closed.** Remove both window tags and send it again: a third row with
+`new_run` true, and the count up by 1.
+
+Then send it to the URL with one character of the key changed: `403`, and no new row.
 
 ### B. Connect the form
 
@@ -247,7 +272,11 @@ existed is still on it):
    on the form, without the `form_reentry` tag, and with the token-ready tag.
 2. Submit again with the same address, and once more after that.
 
-Expect **three** `registered` rows for them and a registration count of **3**.
+Expect **three** `registered` rows for them. Whether each one counts depends on
+the window tags at the time: until the registration automation is built,
+nothing adds the window tags, so all three are new runs and the count is **3**.
+Once the automation adds the watch-window tag on registration, the second and
+third submissions will be within an open window: logged, but not counted.
 
 The existing new-subscriber webhook to `kit-set-indiv-token` will also run for
 brand-new subscribers. That's harmless: both functions make the identical token.

@@ -9,15 +9,23 @@ For each registration it:
   2. then, in a background run:
      a. makes sure the subscriber has a valid indiv_token (creates and saves it
         only if it's missing or invalid - an existing token is never changed)
-     b. adds 1 to the registration count field, once per registration
+     b. checks whether the subscriber already has a watch-and-purchase window
+        open (the watch-window or cart-window tag). If not, this registration
+        starts a new "run": the row is marked new_run = true and the
+        registration count goes up by 1. If a window is open, the row is
+        marked new_run = false and nothing is counted.
      c. adds the "token ready" tag, which releases the confirmation email -
-        last, so the token is always saved before the email can be sent
+        last, so the token is always saved first, and so the window check in
+        (b) sees the tags as they were before this registration (the
+        registration automation that resets windows starts on this tag)
 
-Counting once per registration: before increasing the count, the job marks
-that registration's row in the event log as counted. DynamoDB only accepts
-the first mark, so a retried job can never count the same registration twice.
-If Kit then fails in a way worth retrying, the mark is removed again so the
-retry can count it.
+new_run is recorded on the row only once, so a retried job can't change the
+decision later after the windows have moved on.
+
+Counting once per run: before increasing the count, the job marks that
+registration's row as counted. DynamoDB only accepts the first mark, so a
+retried job can never count the same registration twice. If Kit then fails in
+a way worth retrying, the mark is removed again so the retry can count it.
 
 How it works - the function runs in two modes, like kit-set-indiv-token:
 
@@ -47,6 +55,8 @@ Store, and the function refuses to run if any of these is missing:
     token-field                   String: Kit custom field key holding the token
     registration-count-field      String: Kit custom field key for the registration count
     token-ready-tag-id            String: Kit tag ID added once the token exists
+    watch-window-tag-id           String: Kit tag ID meaning "watch window open"
+    cart-window-tag-id            String: Kit tag ID meaning "cart window open"
 
 Lambda environment variables (all optional except FAILURE_TOPIC_ARN):
   FAILURE_TOPIC_ARN     SNS topic for failure emails
@@ -247,13 +257,55 @@ def process_registration(subscriber_id, event_at):
             return  # reported; don't release the confirmation email without a token
         logger.info("Saved %s for subscriber %s", cfg["token_field"], subscriber_id)
 
-    # b. Registration count, once per registration
-    count_registration(subscriber_id, event_at, fields.get(cfg["registration_count_field"]), cfg)
+    # b. New run? Decide once, from the window tags as they were before this registration
+    window_open = has_open_window(subscriber_id, cfg)
+    new_run = record_new_run(subscriber_id, event_at, not window_open)
+    if new_run:
+        count_registration(subscriber_id, event_at, fields.get(cfg["registration_count_field"]), cfg)
+    else:
+        logger.info("Subscriber %s re-registered with a window open: not counted", subscriber_id)
 
     # c. Token ready - last, because it releases the confirmation email
     status, body = kit_request("POST", f"tags/{cfg['token_ready_tag_id']}/subscribers/{subscriber_id}", {}, key)
     if check_kit_status(status, body, f"adding the token-ready tag to subscriber {subscriber_id}"):
         logger.info("Added token-ready tag to subscriber %s", subscriber_id)
+
+
+def has_open_window(subscriber_id, cfg):
+    """True if the subscriber currently has the watch-window or cart-window tag."""
+    window_tags = {int(cfg["watch_window_tag_id"]), int(cfg["cart_window_tag_id"])}
+    cursor = None
+    while True:
+        endpoint = f"subscribers/{subscriber_id}/tags?per_page=1000"
+        if cursor:
+            endpoint += "&after=" + urllib.parse.quote(cursor)
+        status, body = kit_request("GET", endpoint, None, cfg["kit_api_key"])
+        if not check_kit_status(status, body, f"reading tags for subscriber {subscriber_id}"):
+            # Can't tell: raise so Lambda retries rather than guessing
+            raise RetryableError(f"Could not read tags for subscriber {subscriber_id}")
+        try:
+            data = json.loads(body)
+            tag_ids = {int(tag["id"]) for tag in data["tags"]}
+            pagination = data.get("pagination") or {}
+        except (ValueError, KeyError, TypeError) as error:
+            raise RetryableError(f"Unexpected tag list for subscriber {subscriber_id}: {body[:300]}") from error
+        if tag_ids & window_tags:
+            return True
+        if not pagination.get("has_next_page"):
+            return False
+        cursor = pagination.get("end_cursor")
+
+
+def record_new_run(subscriber_id, event_at, new_run):
+    """Record new_run on the registration row the first time; return the value stored (the first decision wins)."""
+    response = events_table().update_item(
+        Key={"subscriber_id": subscriber_id, "event_at": event_at},
+        UpdateExpression="SET new_run = if_not_exists(new_run, :new_run)",
+        ConditionExpression="attribute_exists(event_at)",
+        ExpressionAttributeValues={":new_run": new_run},
+        ReturnValues="ALL_NEW",  # the whole row, so the stored value is returned even when unchanged
+    )
+    return bool(response["Attributes"]["new_run"])
 
 
 def count_registration(subscriber_id, event_at, current_value, cfg):
@@ -381,6 +433,8 @@ def settings():
             "token_field": own + "token-field",
             "registration_count_field": own + "registration-count-field",
             "token_ready_tag_id": own + "token-ready-tag-id",
+            "watch_window_tag_id": own + "watch-window-tag-id",
+            "cart_window_tag_id": own + "cart-window-tag-id",
         }
         response = ssm_client().get_parameters(Names=list(names.values()), WithDecryption=True)
         found = {p["Name"]: p["Value"] for p in response["Parameters"]}
@@ -388,9 +442,9 @@ def settings():
         if missing:
             raise RuntimeError(f"Missing or empty parameters: {', '.join(missing)}")
         loaded = {key: found[name].strip() for key, name in names.items()}
-        if not loaded["token_ready_tag_id"].isdigit():
-            raise RuntimeError(f"{names['token_ready_tag_id']} must be a Kit tag ID (digits only), "
-                               f"got {loaded['token_ready_tag_id']!r}")
+        for key in ("token_ready_tag_id", "watch_window_tag_id", "cart_window_tag_id"):
+            if not loaded[key].isdigit():
+                raise RuntimeError(f"{names[key]} must be a Kit tag ID (digits only), got {loaded[key]!r}")
         _settings = loaded
     return _settings
 

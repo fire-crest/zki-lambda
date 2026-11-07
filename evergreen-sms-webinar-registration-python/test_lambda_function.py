@@ -33,6 +33,8 @@ TEST_SETTINGS = {
     "token_field": os.environ.get("TEST_TOKEN_FIELD", "test_token"),
     "registration_count_field": os.environ.get("TEST_REGISTRATION_COUNT_FIELD", "test_registration_count"),
     "token_ready_tag_id": os.environ.get("TEST_TOKEN_READY_TAG_ID", "1000003"),
+    "watch_window_tag_id": os.environ.get("TEST_WATCH_WINDOW_TAG_ID", "1000004"),
+    "cart_window_tag_id": os.environ.get("TEST_CART_WINDOW_TAG_ID", "1000005"),
 }
 SUB = os.environ.get("TEST_SUBSCRIBER_ID", "1234567890")
 SUB2 = "1234567891"
@@ -44,6 +46,9 @@ HOOK = TEST_SETTINGS["webhook_key"]
 TOKEN_FIELD = TEST_SETTINGS["token_field"]
 COUNT_FIELD = TEST_SETTINGS["registration_count_field"]
 READY_TAG = TEST_SETTINGS["token_ready_tag_id"]
+WATCH_WINDOW_TAG = TEST_SETTINGS["watch_window_tag_id"]
+CART_WINDOW_TAG = TEST_SETTINGS["cart_window_tag_id"]
+OTHER_TAG = "1000099"
 EVENT_AT = "2026-01-01T12:00:00.000Z#abc123"
 CONTEXT = SimpleNamespace(invoked_function_arn="arn:aws:lambda:eu-west-2:111:function:test-function")
 
@@ -158,9 +163,10 @@ class WebhookTests(unittest.TestCase):
 class FakeKit:
     """Pretends to be Kit for one subscriber: records calls, keeps fields."""
 
-    def __init__(self, token=None, count=None, fail=None):
+    def __init__(self, token=None, count=None, fail=None, tags=()):
         self.calls = []
         self.fields = {TOKEN_FIELD: token, COUNT_FIELD: count}
+        self.tags = [int(t) for t in tags]
         self.fail = dict(fail or {})  # {(method, first path part): [(status, body), ...]} used in order
 
     def __call__(self, method, endpoint, body, key):
@@ -168,6 +174,9 @@ class FakeKit:
         queued = self.fail.get((method, endpoint.split("/")[0]))
         if queued:
             return queued.pop(0)
+        if method == "GET" and "/tags" in endpoint:
+            return 200, json.dumps({"tags": [{"id": t, "name": f"tag {t}"} for t in self.tags],
+                                    "pagination": {"has_next_page": False}})
         if method == "POST":
             return 201, "{}"
         if method == "PUT":
@@ -179,17 +188,24 @@ class FakeKit:
 
 
 class JobTests(unittest.TestCase):
+    """The event log is faked: self.marks holds counted registrations, self.new_runs the recorded new_run values."""
+
     def setUp(self):
         self.marks = set()
+        self.new_runs = {}
         patchers = [
             mock.patch.object(fn, "settings", return_value=SECRETS),
             mock.patch.object(fn, "notify_failure"),
             mock.patch.object(fn, "mark_counted", side_effect=self.fake_mark),
             mock.patch.object(fn, "unmark_counted", side_effect=lambda s, e: self.marks.discard((s, e))),
+            mock.patch.object(fn, "record_new_run", side_effect=self.fake_record_new_run),
         ]
-        self.settings, self.notify, self.mark, self.unmark = [p.start() for p in patchers]
+        self.settings, self.notify, self.mark, self.unmark, self.record = [p.start() for p in patchers]
         for p in patchers:
             self.addCleanup(p.stop)
+
+    def fake_record_new_run(self, subscriber_id, event_at, new_run):
+        return self.new_runs.setdefault((subscriber_id, event_at), new_run)  # first decision wins
 
     def fake_mark(self, subscriber_id, event_at):
         if (subscriber_id, event_at) in self.marks:
@@ -207,15 +223,15 @@ class JobTests(unittest.TestCase):
         self.assertEqual(kit_token.read_token(kit.fields[TOKEN_FIELD], KEY), SUB)
         self.assertEqual(kit.fields[COUNT_FIELD], "1")
         self.assertEqual(kit.calls[-1][:2], ("POST", f"tags/{READY_TAG}/subscribers/{SUB}"))
-        self.assertEqual(kit.methods(), ["GET", "PUT", "PUT", "POST"])
+        self.assertEqual(kit.methods(), ["GET", "PUT", "GET", "PUT", "POST"])
         self.notify.assert_not_called()
 
     def test_existing_valid_token_never_rewritten(self):
         token = kit_token.make_token(SUB, KEY)
         kit = FakeKit(token=token, count="2")
         self.run_job(kit)
-        self.assertEqual(kit.methods(), ["GET", "PUT", "POST"])  # only the count PUT
-        self.assertNotIn(TOKEN_FIELD, kit.calls[1][2])
+        self.assertEqual(kit.methods(), ["GET", "GET", "PUT", "POST"])  # only the count PUT
+        self.assertNotIn(TOKEN_FIELD, kit.calls[2][2])
         self.assertEqual(kit.fields[COUNT_FIELD], "3")
 
     def test_invalid_or_old_token_replaced(self):
@@ -223,6 +239,7 @@ class JobTests(unittest.TestCase):
                     kit_token.make_token(SUB, OTHER_KEY), kit_token.make_token(SUB2, KEY)]:
             kit = FakeKit(token=bad)
             self.marks.clear()
+            self.new_runs.clear()
             self.run_job(kit)
             self.assertEqual(kit_token.read_token(kit.fields[TOKEN_FIELD], KEY), SUB, bad)
 
@@ -230,6 +247,7 @@ class JobTests(unittest.TestCase):
         for start in [None, "", "abc", "-1"]:
             kit = FakeKit(token=kit_token.make_token(SUB, KEY), count=start)
             self.marks.clear()
+            self.new_runs.clear()
             self.run_job(kit)
             self.assertEqual(kit.fields[COUNT_FIELD], "1", start)
 
@@ -262,6 +280,65 @@ class JobTests(unittest.TestCase):
             self.run_job(kit)
         self.run_job(kit)
         self.assertEqual(kit.fields[COUNT_FIELD], "6")
+
+    def test_window_open_not_counted_but_token_ready_still_added(self):
+        for open_tag in (WATCH_WINDOW_TAG, CART_WINDOW_TAG):
+            kit = FakeKit(token=kit_token.make_token(SUB, KEY), count="2", tags=[OTHER_TAG, open_tag])
+            self.new_runs.clear()
+            self.run_job(kit)
+            self.assertEqual(kit.fields[COUNT_FIELD], "2", open_tag)
+            self.assertEqual(self.new_runs[(SUB, EVENT_AT)], False)
+            self.assertEqual(kit.calls[-1][:2], ("POST", f"tags/{READY_TAG}/subscribers/{SUB}"))
+        self.mark.assert_not_called()
+
+    def test_no_window_open_starts_a_new_run(self):
+        kit = FakeKit(token=kit_token.make_token(SUB, KEY), count="2", tags=[OTHER_TAG])
+        self.run_job(kit)
+        self.assertEqual(kit.fields[COUNT_FIELD], "3")
+        self.assertEqual(self.new_runs[(SUB, EVENT_AT)], True)
+
+    def test_window_check_happens_before_token_ready(self):
+        kit = FakeKit(token=kit_token.make_token(SUB, KEY))
+        self.run_job(kit)
+        tag_read = next(i for i, c in enumerate(kit.calls) if c[0] == "GET" and "/tags" in c[1])
+        token_ready = next(i for i, c in enumerate(kit.calls) if c[0] == "POST")
+        self.assertLess(tag_read, token_ready)
+
+    def test_retry_keeps_the_first_decision(self):
+        # First attempt: no window open, so a new run - but Kit fails before counting
+        kit = FakeKit(token=kit_token.make_token(SUB, KEY), count="2",
+                      fail={("PUT", "subscribers"): [(503, "down")]})
+        with self.assertRaises(fn.RetryableError):
+            self.run_job(kit)
+        # By the time Lambda retries, the windows have moved on and a window tag is present
+        kit.tags = [int(WATCH_WINDOW_TAG)]
+        self.run_job(kit)
+        self.assertEqual(kit.fields[COUNT_FIELD], "3")  # still counted, as first decided
+
+    def test_cant_read_tags_retries_rather_than_guessing(self):
+        kit = FakeKit(token=kit_token.make_token(SUB, KEY), count="2")
+        real = kit.__call__
+        def flaky(method, endpoint, body, key):
+            if "/tags" in endpoint and method == "GET":
+                return 500, "oops"
+            return real(method, endpoint, body, key)
+        with self.assertRaises(fn.RetryableError):
+            self.run_job(flaky)
+        self.assertEqual(self.new_runs, {})
+        self.assertEqual(kit.fields[COUNT_FIELD], "2")
+
+    def test_tag_list_paging(self):
+        pages = [
+            {"tags": [{"id": 1}], "pagination": {"has_next_page": True, "end_cursor": "abc=="}},
+            {"tags": [{"id": int(CART_WINDOW_TAG)}], "pagination": {"has_next_page": False}},
+        ]
+        seen = []
+        def kit(method, endpoint, body, key):
+            seen.append(endpoint)
+            return 200, json.dumps(pages[len(seen) - 1])
+        with mock.patch.object(fn, "kit_request", side_effect=kit):
+            self.assertTrue(fn.has_open_window(SUB, SECRETS))
+        self.assertIn("after=abc%3D%3D", seen[1])
 
     def test_token_save_failure_blocks_token_ready(self):
         kit = FakeKit(fail={("PUT", "subscribers"): [(422, "bad field")]})
@@ -334,6 +411,21 @@ class MarkerTests(unittest.TestCase):
         # ...and it must not have created a stray row
         self.assertNotIn("Item", fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": EVENT_AT}))
 
+    def test_new_run_first_decision_wins(self):
+        event_at = fn.log_registration(SUB)
+        self.assertTrue(fn.record_new_run(SUB, event_at, True))
+        self.assertTrue(fn.record_new_run(SUB, event_at, False))  # a retry can't change it
+        row = fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": event_at})["Item"]
+        self.assertIs(row["new_run"], True)
+
+    def test_new_run_false_recorded(self):
+        event_at = fn.log_registration(SUB)
+        self.assertFalse(fn.record_new_run(SUB, event_at, False))
+
+    def test_new_run_needs_an_existing_row(self):
+        with self.assertRaises(ClientError):
+            fn.record_new_run(SUB, EVENT_AT, True)
+
     def test_logged_row_contents(self):
         event_at = fn.log_registration(SUB)
         row = fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": event_at})["Item"]
@@ -357,6 +449,8 @@ class SettingsTests(unittest.TestCase):
             self.OWN + "token-field": TOKEN_FIELD,
             self.OWN + "registration-count-field": " " + COUNT_FIELD,
             self.OWN + "token-ready-tag-id": READY_TAG,
+            self.OWN + "watch-window-tag-id": WATCH_WINDOW_TAG,
+            self.OWN + "cart-window-tag-id": CART_WINDOW_TAG,
         }
 
     def load(self, overrides=None):
@@ -380,9 +474,10 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError, msg=name):
                     self.load({name: missing})
 
-    def test_tag_must_be_an_id(self):
-        with self.assertRaises(RuntimeError):
-            self.load({self.OWN + "token-ready-tag-id": "token_ready"})
+    def test_tags_must_be_ids(self):
+        for name in ("token-ready-tag-id", "watch-window-tag-id", "cart-window-tag-id"):
+            with self.assertRaises(RuntimeError, msg=name):
+                self.load({self.OWN + name: "a_tag_name"})
 
 
 class NoBusinessDetailsTests(unittest.TestCase):
@@ -400,7 +495,8 @@ class NoBusinessDetailsTests(unittest.TestCase):
         # Field keys and tag names are read from Parameter Store, never written as quoted text
         quoted = set(re.findall(r'"([a-z0-9_]+)"', inspect.getsource(fn)))
         allowed_settings_keys = {"kit_api_key", "token_secret", "webhook_key", "token_field",
-                                 "registration_count_field", "token_ready_tag_id"}
+                                 "registration_count_field", "token_ready_tag_id",
+                                 "watch_window_tag_id", "cart_window_tag_id"}
         suspicious = {q for q in quoted - allowed_settings_keys
                       if q.endswith(("_token", "_count", "_ready")) or q.startswith("indiv")}
         self.assertEqual(suspicious, set())

@@ -20,8 +20,8 @@ flowchart TD
     Fn -->|"2. write event row"| DB
     Fn -->|"3. reply 200"| Page
     Fn -->|"4. started / reached_pitch only"| Job
-    Job -->|"5. tag; +1 to watch count,<br/>once per registration"| Kit["Kit API v4"]
-    Job -->|"find latest registration,<br/>mark it counted"| DB
+    Job -->|"5. tag; +1 to watch count,<br/>once per run"| Kit["Kit API v4"]
+    Job -->|"find start of latest run,<br/>mark it counted"| DB
     Job -. "Kit busy: automatic retries<br/>still failing: email" .-> SNS
 ```
 
@@ -31,7 +31,7 @@ flowchart TD
 |---|---|---|---|
 | `started` | 30 seconds of playback, so auto-play alone doesn't count | tag `started-tag-id` | ✅ |
 | `progress` | every 10 minutes: `minute` 10, 20, 30… | nothing | ✅ with the minute |
-| `reached_pitch` | the pitch timestamp | tag `watched-tag-id`, then add 1 to `watch-count-field`, **once per registration** | ✅ |
+| `reached_pitch` | the pitch timestamp | tag `watched-tag-id`, then add 1 to `watch-count-field`, **once per run** | ✅ |
 
 The page sends:
 
@@ -51,23 +51,29 @@ A blank or non-numeric watch count counts as 0. The tag IDs, field name and
 allowed website all come from Parameter Store (step 2 below), so none of them
 appear in the code or this guide.
 
-## The watch count: once per registration
+## The watch count: once per run
 
-The watch count means "how many registrations they watched to the pitch",
-e.g. how many times someone registered and watched before buying.
+A **run** is one watch-and-purchase window: the watch window, then the cart
+window that opens on reaching the pitch. A run starts with a registration made
+while no window was open; `evergreen-sms-webinar-registration` marks that
+`registered` row `new_run = true`. Re-registering while a window is open
+doesn't start a new run.
+
+The watch count means "how many runs they watched to the pitch", e.g. before
+buying. It can never exceed the registration count, which counts runs started.
 
 - **Every `reached_pitch` is logged**, re-watches included, so returning viewers
   stay visible in the event log. The tag is added every time too (harmless).
-- **The count goes up once per registration.** The background job finds the
-  subscriber's latest `registered` row (written by
-  `evergreen-sms-webinar-registration`) and marks it `pitch_counted_at`.
-  DynamoDB accepts only the first mark, so a re-watch, a second browser tab or
-  a retried job can't count twice. Only the call that made the mark adds 1.
+- **The count goes up once per run.** The background job finds the latest
+  `registered` row with `new_run = true` and marks it `pitch_counted_at`.
+  DynamoDB accepts only the first mark, so a re-watch during the open cart, a
+  second browser tab or a retried job can't count twice. Only the call that
+  made the mark adds 1.
 - **If Kit is busy** when saving the count, the mark is removed again, so
   Lambda's automatic retry can count it.
-- **No registration on record** (e.g. a subscriber who never used the
-  registration form): the event is logged and tagged, but not counted, and
-  admin is emailed.
+- **No run on record** (e.g. a subscriber who never used the registration form,
+  or whose registrations all predate run tracking): the event is logged and
+  tagged, but not counted, and admin is emailed.
 
 ## The event log: table `evergreen_events`
 
@@ -234,8 +240,9 @@ The endpoint is the Function URL followed by `milestone`, e.g.
 
 ## Test calls
 
-Use a test subscriber who has **registered through the form** at least once,
-and their **current** `indiv_token` from Kit. Before you start, remove the
+Use a test subscriber whose latest registration **started a run** (a
+`registered` row with `new_run` true; register them again with no window tags
+if not), and their **current** `indiv_token` from Kit. Before you start, remove the
 "started" and "reached the pitch" tags from them and note their watch count.
 
 In Postman, POST to `…on.aws/milestone` with body type raw → JSON:
@@ -252,15 +259,19 @@ In Postman, POST to `…on.aws/milestone` with body type raw → JSON:
 
 Then check the log: **DynamoDB** → **Explore items** → `evergreen_events`. There
 should be four new rows for the subscriber's ID (`started`, `progress` with minute 10,
-and two `reached_pitch`), and none for calls 4–6. Their latest `registered`
-row should now have `pitch_counted_at`.
+and two `reached_pitch`), and none for calls 4–6. The `registered` row that
+started their run should now have `pitch_counted_at`.
 
-**Once per registration.** Submit the registration form again with the test
-subscriber's email, then repeat call 3: the watch count goes up by 1 again.
+**Re-registering within the run.** Give the test subscriber the cart-window tag
+by hand, submit the registration form, then repeat call 3: the watch count does
+**not** go up (the registration was logged with `new_run` false).
 
-**No registration.** Repeat call 3 with the token of a subscriber who has never
-used the registration form: `200` and the tag, but no change to their watch
-count, and a failure email saying they had no registration on record.
+**A new run.** Remove both window tags, submit the registration form again,
+then repeat call 3: the watch count goes up by 1.
+
+**No run.** Repeat call 3 with the token of a subscriber who has never used the
+registration form: `200` and the tag, but no change to their watch count, and a
+failure email saying they had no run on record.
 
 **Website check.** Open any other website (e.g. `https://example.com`), open the
 browser's developer console (View → Developer → JavaScript Console in Chrome)
