@@ -20,7 +20,8 @@ flowchart TD
     Fn -->|"2. write event row"| DB
     Fn -->|"3. reply 200"| Page
     Fn -->|"4. started / reached_pitch only"| Job
-    Job -->|"5. tag, add 1 to watch count"| Kit["Kit API v4"]
+    Job -->|"5. tag; +1 to watch count,<br/>once per registration"| Kit["Kit API v4"]
+    Job -->|"find latest registration,<br/>mark it counted"| DB
     Job -. "Kit busy: automatic retries<br/>still failing: email" .-> SNS
 ```
 
@@ -30,7 +31,7 @@ flowchart TD
 |---|---|---|---|
 | `started` | 30 seconds of playback, so auto-play alone doesn't count | tag `started-tag-id` | ✅ |
 | `progress` | every 10 minutes: `minute` 10, 20, 30… | nothing | ✅ with the minute |
-| `reached_pitch` | the pitch timestamp | tag `watched-tag-id`, then add 1 to `watch-count-field` | ✅ |
+| `reached_pitch` | the pitch timestamp | tag `watched-tag-id`, then add 1 to `watch-count-field`, **once per registration** | ✅ |
 
 The page sends:
 
@@ -50,6 +51,24 @@ A blank or non-numeric watch count counts as 0. The tag IDs, field name and
 allowed website all come from Parameter Store (step 2 below), so none of them
 appear in the code or this guide.
 
+## The watch count: once per registration
+
+The watch count means "how many registrations they watched to the pitch",
+e.g. how many times someone registered and watched before buying.
+
+- **Every `reached_pitch` is logged**, re-watches included, so returning viewers
+  stay visible in the event log. The tag is added every time too (harmless).
+- **The count goes up once per registration.** The background job finds the
+  subscriber's latest `registered` row (written by
+  `evergreen-sms-webinar-registration`) and marks it `pitch_counted_at`.
+  DynamoDB accepts only the first mark, so a re-watch, a second browser tab or
+  a retried job can't count twice. Only the call that made the mark adds 1.
+- **If Kit is busy** when saving the count, the mark is removed again, so
+  Lambda's automatic retry can count it.
+- **No registration on record** (e.g. a subscriber who never used the
+  registration form): the event is logged and tagged, but not counted, and
+  admin is emailed.
+
 ## The event log: table `evergreen_events`
 
 | Attribute | Example | |
@@ -59,6 +78,7 @@ appear in the code or this guide.
 | `event` | `started`, `progress`, `reached_pitch` | |
 | `minute` | `20` | `progress` only |
 | `source` | `watch_page` | |
+| `pitch_counted_at` | `2026-11-07T10:20:01+00:00` | on `registered` rows only: set when that registration's watch has been counted |
 
 The index `by_event` (partition `event`, sort `event_at`) answers "all `started` events between two dates". Rows
 contain Kit subscriber IDs only, never email addresses. Later steps add more
@@ -73,7 +93,7 @@ event types (registrations, sales page visits, purchases) to the same table.
 |---|---|
 | `lambda_function.py` | The function |
 | `kit_token.py` | Reads tokens. Identical to the copy in `kit-set-indiv-token-python`: keep them the same |
-| `test_lambda_function.py` | Tests (`python3 -m unittest -v`). No AWS or Kit needed |
+| `test_lambda_function.py` | Tests (`python3 -m unittest -v`). No AWS or Kit needed. The event log tests also need `pip install "moto[dynamodb]"`, and are skipped without it |
 
 It needs the same `cryptography-py313-arm64` layer as `kit-set-indiv-token`.
 
@@ -159,7 +179,7 @@ Replace `REGION` and `ACCOUNT` (3 places each) with your region and 12-digit acc
     },
     {
       "Effect": "Allow",
-      "Action": "dynamodb:PutItem",
+      "Action": ["dynamodb:PutItem", "dynamodb:Query", "dynamodb:UpdateItem"],
       "Resource": "arn:aws:dynamodb:REGION:ACCOUNT:table/evergreen_events"
     },
     {
@@ -178,7 +198,7 @@ Replace `REGION` and `ACCOUNT` (3 places each) with your region and 12-digit acc
 
 Name the policy `evergreen-sms-webinar-watch-access`.
 
-The function only ever *adds* rows. It has no permission to read, change or delete the log.
+The function adds rows, reads one subscriber's history (`Query`) to find their latest registration, and sets or removes the `pitch_counted_at` mark (`UpdateItem`). It can't delete rows.
 
 ### 6. Retries, failure emails, concurrency
 
@@ -214,9 +234,9 @@ The endpoint is the Function URL followed by `milestone`, e.g.
 
 ## Test calls
 
-Use a test subscriber's **current** `indiv_token` from Kit. Before you start,
-remove the "started" and "reached the pitch" tags from
-them and note their watch count.
+Use a test subscriber who has **registered through the form** at least once,
+and their **current** `indiv_token` from Kit. Before you start, remove the
+"started" and "reached the pitch" tags from them and note their watch count.
 
 In Postman, POST to `…on.aws/milestone` with body type raw → JSON:
 
@@ -225,13 +245,22 @@ In Postman, POST to `…on.aws/milestone` with body type raw → JSON:
 | 1 | `{"token": "TOKEN", "milestone": "started"}` | `200`. Within seconds, the subscriber has the "started" tag |
 | 2 | `{"token": "TOKEN", "milestone": "progress", "minute": 10}` | `200`. Nothing changes in Kit |
 | 3 | `{"token": "TOKEN", "milestone": "reached_pitch"}` | `200`. They have the "reached the pitch" tag, and the watch count has gone up by 1 |
+| 3a | the same as 3, again | `200`. Another `reached_pitch` row, but the watch count does **not** go up |
 | 4 | `{"token": "TOKEN", "milestone": "progress", "minute": 15}` | `400` |
 | 5 | `{"token": "TOKEN", "milestone": "purchased"}` | `400` |
 | 6 | `{"token": "TOKEN-WITH-ONE-LETTER-CHANGED", "milestone": "started"}` | `403` |
 
 Then check the log: **DynamoDB** → **Explore items** → `evergreen_events`. There
-should be three rows for the subscriber's ID (`started`, `progress` with minute 10,
-`reached_pitch`), and none for calls 4–6.
+should be four new rows for the subscriber's ID (`started`, `progress` with minute 10,
+and two `reached_pitch`), and none for calls 4–6. Their latest `registered`
+row should now have `pitch_counted_at`.
+
+**Once per registration.** Submit the registration form again with the test
+subscriber's email, then repeat call 3: the watch count goes up by 1 again.
+
+**No registration.** Repeat call 3 with the token of a subscriber who has never
+used the registration form: `200` and the tag, but no change to their watch
+count, and a failure email saying they had no registration on record.
 
 **Website check.** Open any other website (e.g. `https://example.com`), open the
 browser's developer console (View → Developer → JavaScript Console in Chrome)
@@ -243,23 +272,3 @@ fetch("https://YOUR-URL.lambda-url.REGION.on.aws/milestone", {method: "POST", he
 
 You should see **Blocked** (a CORS error), and no new row in the log.
 Running the same line from a page on your allowed website should print `200`.
-
----
-
-## Planned for step 2 (agreed 6 Nov 2026)
-
-These change when the Kit sign-up webhook starts logging `registered` rows:
-
-- **Every event stays in the log**, re-watches included, so returning viewers are visible.
-- **The watch count goes up once per registration**, not once per `reached_pitch`.
-  It means "how many registrations they actually watched to the pitch before buying".
-  On `reached_pitch`, Lambda finds the subscriber's latest `registered` row and
-  writes a one-off "counted" marker for it. DynamoDB accepts only the first
-  marker, so two tabs at once can't count twice, and only then is the Kit count increased.
-- **No registration on record** (e.g. a test subscriber): proposed to log the
-  event, not count it, and email admin. To confirm when planning step 2.
-- **Extra permission:** `dynamodb:Query` on `evergreen_events`, so the function can
-  read one subscriber's history.
-
-Until then, every `reached_pitch` adds 1, which is harmless before launch.
-

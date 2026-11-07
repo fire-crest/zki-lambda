@@ -1,5 +1,7 @@
 """
-Tests for evergreen-sms-webinar-watch. Nothing here touches AWS or Kit - those are faked.
+Tests for evergreen-sms-webinar-watch. AWS and Kit are faked; the DynamoDB
+tests use moto's in-memory DynamoDB if it's installed
+(pip install "moto[dynamodb]"), and are skipped otherwise.
 
 Run from this folder:   python3 -m unittest -v
 
@@ -202,13 +204,29 @@ class FakeKit:
         return 200, json.dumps({"subscriber": {"id": int(SUB), "fields": self.fields}})
 
 
+REGISTRATION = "2026-01-01T12:00:00.000Z#abc123"
+
+
 class JobTests(unittest.TestCase):
+    """The event log is faked: self.registration is the latest 'registered' row, self.marks the counted ones."""
+
     def setUp(self):
+        self.registration = REGISTRATION
+        self.marks = set()
         patchers = [mock.patch.object(fn, "settings", return_value=SECRETS),
-                    mock.patch.object(fn, "notify_failure")]
-        self.settings, self.notify = [p.start() for p in patchers]
+                    mock.patch.object(fn, "notify_failure"),
+                    mock.patch.object(fn, "latest_registration", side_effect=lambda s: self.registration),
+                    mock.patch.object(fn, "mark_pitch_counted", side_effect=self.fake_mark),
+                    mock.patch.object(fn, "unmark_pitch_counted", side_effect=lambda s, r: self.marks.discard((s, r)))]
+        self.settings, self.notify, self.latest, self.mark, self.unmark = [p.start() for p in patchers]
         for p in patchers:
             self.addCleanup(p.stop)
+
+    def fake_mark(self, subscriber_id, registration):
+        if (subscriber_id, registration) in self.marks:
+            return False
+        self.marks.add((subscriber_id, registration))
+        return True
 
     def run_job(self, kit, milestone="reached_pitch", subscriber_id=SUB):
         with mock.patch.object(fn, "kit_request", side_effect=kit):
@@ -230,6 +248,7 @@ class JobTests(unittest.TestCase):
     def test_blank_or_junk_counts_as_zero(self):
         for start in [None, "", "  ", "abc", "-3", "2.5"]:
             kit = FakeKit(count=start)
+            self.marks.clear()
             self.run_job(kit)
             self.assertEqual(kit.fields[COUNT_FIELD], "1", start)
 
@@ -238,12 +257,56 @@ class JobTests(unittest.TestCase):
         self.run_job(kit)
         self.assertEqual(kit.fields[COUNT_FIELD], "8")
 
+    def test_rewatch_in_same_registration_not_counted_again(self):
+        kit = FakeKit(count="4")
+        self.run_job(kit)
+        self.run_job(kit)  # re-watch, second tab or Lambda retry
+        self.assertEqual(kit.fields[COUNT_FIELD], "5")
+        self.assertEqual([c[0] for c in kit.calls].count("POST"), 2)  # tag still added each time
+        self.notify.assert_not_called()
+
+    def test_new_registration_counted_again(self):
+        kit = FakeKit(count="4")
+        self.run_job(kit)
+        self.registration = "2026-01-05T09:00:00.000Z#def456"  # they registered again
+        self.run_job(kit)
+        self.assertEqual(kit.fields[COUNT_FIELD], "6")
+
+    def test_no_registration_logged_tagged_not_counted_and_reported(self):
+        self.registration = None
+        kit = FakeKit(count="4")
+        self.run_job(kit)
+        self.assertEqual(kit.calls, [("POST", f"tags/{WATCHED_TAG}/subscribers/{SUB}")])
+        self.assertEqual(kit.fields[COUNT_FIELD], "4")
+        self.notify.assert_called_once()
+        self.assertIn("no registration", self.notify.call_args.args[0])
+
+    def test_kit_busy_on_count_unmarks_so_retry_counts(self):
+        kit = FakeKit(count="4", fail={("PUT", "subscribers"): (429, "busy")})
+        with self.assertRaises(fn.RetryableError):
+            self.run_job(kit)
+        self.assertEqual(self.marks, set())
+        del kit.fail[("PUT", "subscribers")]
+        self.run_job(kit)  # Lambda's retry
+        self.assertEqual(kit.fields[COUNT_FIELD], "5")
+
+    def test_event_log_error_retries(self):
+        self.latest.side_effect = Exception("dynamo down")
+        with self.assertRaises(Exception):
+            self.run_job(FakeKit(count="4"))
+
+    def test_started_never_touches_the_count(self):
+        self.run_job(FakeKit(), "started")
+        self.latest.assert_not_called()
+        self.mark.assert_not_called()
+
     def test_kit_busy_retries_before_counting(self):
         for status in [429, 500, 503]:
             kit = FakeKit(count="1", fail={("POST", "tags"): (status, "busy")})
             with self.assertRaises(fn.RetryableError):
                 self.run_job(kit)
             self.assertNotIn("PUT", [c[0] for c in kit.calls])  # never counted
+            self.assertEqual(self.marks, set())  # and not marked, so the retry counts
 
     def test_kit_client_error_reported_not_retried(self):
         kit = FakeKit(count="1", fail={("POST", "tags"): (404, "no such tag")})
@@ -264,6 +327,76 @@ class JobTests(unittest.TestCase):
         self.run_job(kit, subscriber_id="abc")
         self.assertEqual(kit.calls, [])
         self.assertEqual(self.notify.call_count, 2)
+
+
+# ---------------------------------------------------------------------------
+# Finding and marking registrations, against an in-memory DynamoDB
+# ---------------------------------------------------------------------------
+
+try:
+    import boto3
+    from moto import mock_aws
+except ImportError:
+    mock_aws = None
+
+
+@unittest.skipIf(mock_aws is None, "moto not installed")
+class EventLogTests(unittest.TestCase):
+    def setUp(self):
+        os.environ.setdefault("AWS_DEFAULT_REGION", "eu-west-2")
+        os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
+        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+        self.aws = mock_aws()
+        self.aws.start()
+        self.addCleanup(self.aws.stop)
+        boto3.client("dynamodb").create_table(
+            TableName=fn.EVENTS_TABLE, BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("subscriber_id", "event_at")],
+            KeySchema=[{"AttributeName": "subscriber_id", "KeyType": "HASH"},
+                       {"AttributeName": "event_at", "KeyType": "RANGE"}])
+        fn._clients.pop("table", None)
+        self.addCleanup(fn._clients.pop, "table", None)
+
+    def put(self, subscriber_id, event_at, event):
+        fn.events_table().put_item(Item={"subscriber_id": subscriber_id, "event_at": event_at, "event": event})
+
+    def test_finds_latest_registration_among_other_events(self):
+        self.put(SUB, "2026-01-01T10:00:00.000Z#a", "registered")
+        self.put(SUB, "2026-01-01T10:05:00.000Z#b", "started")
+        self.put(SUB, "2026-01-03T09:00:00.000Z#c", "registered")
+        self.put(SUB, "2026-01-03T09:10:00.000Z#d", "progress")
+        self.put(SUB, "2026-01-03T10:15:00.000Z#e", "reached_pitch")
+        self.put("999", "2026-01-09T00:00:00.000Z#f", "registered")  # someone else
+        self.assertEqual(fn.latest_registration(SUB), "2026-01-03T09:00:00.000Z#c")
+
+    def test_finds_registration_behind_many_later_events(self):
+        # Many progress rows after the registration: the search must page through them
+        self.put(SUB, "2026-01-01T10:00:00.000Z#reg", "registered")
+        for i in range(300):
+            self.put(SUB, f"2026-01-01T11:{i // 60:02d}:{i % 60:02d}.000Z#{i:03d}", "progress")
+        self.assertEqual(fn.latest_registration(SUB), "2026-01-01T10:00:00.000Z#reg")
+
+    def test_no_registration(self):
+        self.put(SUB, "2026-01-01T10:05:00.000Z#b", "started")
+        self.assertIsNone(fn.latest_registration(SUB))
+        self.assertIsNone(fn.latest_registration("555"))
+
+    def test_first_mark_wins_and_unmark_reopens(self):
+        self.put(SUB, REGISTRATION, "registered")
+        self.assertTrue(fn.mark_pitch_counted(SUB, REGISTRATION))
+        self.assertFalse(fn.mark_pitch_counted(SUB, REGISTRATION))
+        fn.unmark_pitch_counted(SUB, REGISTRATION)
+        self.assertTrue(fn.mark_pitch_counted(SUB, REGISTRATION))
+
+    def test_pitch_mark_independent_of_registration_count_mark(self):
+        # The registration function's counted_at mark must not stop the watch count
+        fn.events_table().put_item(Item={"subscriber_id": SUB, "event_at": REGISTRATION, "event": "registered",
+                                         "counted_at": "2026-01-01T12:00:01+00:00"})
+        self.assertTrue(fn.mark_pitch_counted(SUB, REGISTRATION))
+
+    def test_cannot_mark_missing_registration(self):
+        self.assertFalse(fn.mark_pitch_counted(SUB, REGISTRATION))
+        self.assertNotIn("Item", fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": REGISTRATION}))
 
 
 class SettingsTests(unittest.TestCase):
