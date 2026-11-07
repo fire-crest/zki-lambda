@@ -227,8 +227,9 @@ In Kit, create a temporary tag (e.g. `form_reentry`) and two rules:
 "Unsubscribe from a form" only removes them from that form. They stay active
 on your list (checked in Spike 2).
 
-**Side effect:** Kit's subscriber count and conversion rate for the form stay
-near zero, so don't use Kit's form statistics for this funnel. Registrations
+**Side effect:** Kit's subscriber count will be correct but the repeat subscriptions
+are counted as unique visitors. This reduces the reported conversion rate for the form, 
+so don't rely on Kit's form statistics for this funnel. Registrations
 come from the `registered` rows and the registration count field instead.
 
 **Automations:** don't start the registration automation on the form, because
