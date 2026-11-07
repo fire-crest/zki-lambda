@@ -17,7 +17,17 @@ so it can never apply sms-member or anything else.
 
   started        log it, then tag <started-tag-id>
   progress       log it (with the minute) - never calls Kit
-  reached_pitch  log it, then tag <watched-tag-id> and add 1 to <watch-count-field>
+  reached_pitch  log it, then tag <watched-tag-id> and add 1 to <watch-count-field>,
+                 once per registration (see below)
+
+The watch count means "how many registrations they watched to the pitch".
+Every reached_pitch is logged, re-watches included, but the count only goes
+up once per registration: the job finds the subscriber's latest 'registered'
+row and marks it pitch_counted_at. DynamoDB accepts only the first mark, so a
+re-watch, a second tab or a retried job can't count twice. If Kit then fails
+in a way worth retrying, the mark is removed so the retry can count it.
+Someone with no registration on record is logged and tagged but not counted,
+and admin is emailed.
 
 How it works - the function runs in two modes:
 
@@ -28,7 +38,7 @@ How it works - the function runs in two modes:
    the page and can't lose a milestone.
 
 2. JOB MODE (the background run)
-   Applies the milestone's tags and increments the watch count in Kit. If Kit is
+   Applies the milestone's tags and, once per registration, increments the watch count in Kit. If Kit is
    busy (429) or broken (5xx), or the network fails, the job raises an error and
    Lambda retries it automatically. If every retry fails, Lambda sends the failed
    job to the "on failure" SNS destination, which emails admin.
@@ -68,6 +78,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 import boto3
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.exceptions import ClientError
 
 from kit_token import read_token
 
@@ -245,9 +257,70 @@ def run_kit_actions(subscriber_id, milestone):
     for tag_id in actions["tags"]:
         tag_subscriber(subscriber_id, tag_id, cfg["kit_api_key"])
 
-    # Increment last, so a retry caused by a tag failure can't count twice
+    # Count last, so a retry caused by a tag failure can't count twice
     if actions["increment"]:
-        increment_field(subscriber_id, actions["increment"], cfg["kit_api_key"])
+        count_once_per_registration(subscriber_id, actions["increment"], cfg["kit_api_key"])
+
+
+def count_once_per_registration(subscriber_id, field, api_key):
+    """Add 1 to the watch count, unless this subscriber's latest registration has already been counted."""
+    registration = latest_registration(subscriber_id)  # a DynamoDB error here makes Lambda retry
+    if registration is None:
+        notify_failure(f"Subscriber {subscriber_id} reached the pitch with no registration on record. "
+                       f"Logged and tagged, but {field} was not increased.")
+        return
+    if not mark_pitch_counted(subscriber_id, registration):
+        logger.info("Registration %s for subscriber %s already counted for %s", registration, subscriber_id, field)
+        return
+    try:
+        increment_field(subscriber_id, field, api_key)
+    except RetryableError:
+        unmark_pitch_counted(subscriber_id, registration)  # let the retry count it
+        raise
+
+
+def latest_registration(subscriber_id):
+    """Return the event_at of the subscriber's most recent 'registered' row, or None if there isn't one."""
+    query = {
+        "KeyConditionExpression": Key("subscriber_id").eq(subscriber_id),
+        "FilterExpression": Attr("event").eq("registered"),
+        "ProjectionExpression": "event_at",
+        "ScanIndexForward": False,  # newest first
+    }
+    while True:
+        page = events_table().query(**query)
+        if page.get("Items"):
+            return page["Items"][0]["event_at"]
+        if "LastEvaluatedKey" not in page:
+            return None
+        query["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def mark_pitch_counted(subscriber_id, registration_event_at):
+    """Mark the registration as counted. True if this call made the mark, False if it was already there."""
+    try:
+        events_table().update_item(
+            Key={"subscriber_id": subscriber_id, "event_at": registration_event_at},
+            UpdateExpression="SET pitch_counted_at = :now",
+            ConditionExpression="attribute_exists(event_at) AND attribute_not_exists(pitch_counted_at)",
+            ExpressionAttributeValues={":now": datetime.now(timezone.utc).isoformat()},
+        )
+        return True
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def unmark_pitch_counted(subscriber_id, registration_event_at):
+    try:
+        events_table().update_item(
+            Key={"subscriber_id": subscriber_id, "event_at": registration_event_at},
+            UpdateExpression="REMOVE pitch_counted_at",
+        )
+    except Exception as error:
+        notify_failure(f"Could not unmark registration {registration_event_at} for subscriber {subscriber_id} "
+                       f"after a Kit failure; their watch count may be 1 short: {error}")
 
 
 def tag_subscriber(subscriber_id, tag_id, api_key):
