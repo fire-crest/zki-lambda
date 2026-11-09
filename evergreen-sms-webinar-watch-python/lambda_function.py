@@ -10,6 +10,7 @@ The watch page calls this function's Function URL at each milestone:
     {"token": "<indiv_token>", "milestone": "started"}
     {"token": "<indiv_token>", "milestone": "progress", "minute": 20}
     {"token": "<indiv_token>", "milestone": "reached_pitch"}
+    {"token": "<indiv_token>", "milestone": "cta_click"}
 
 What each milestone does is fixed here (milestone_actions below), using the tag
 IDs and field name from Parameter Store. The page can't choose tags or fields,
@@ -17,8 +18,20 @@ so it can never apply sms-member or anything else.
 
   started        log it, then tag <started-tag-id>
   progress       log it (with the minute) - never calls Kit
-  reached_pitch  log it, then tag <watched-tag-id> and add 1 to <watch-count-field>,
-                 once per run (see below)
+  reached_pitch  log it, then decide whether they watched properly (below). If so,
+                 tag <watched-tag-id> and add 1 to <watch-count-field>, once per run
+  cta_click      log it, then tag <clicked-tag-id> (the buy button was clicked;
+                 this starts the cart for people who skipped to the pitch)
+
+Watched properly ("qualified"): the watch page only sends a progress mark when
+the video actually plays across it, not when someone drags past it. When
+reached_pitch arrives, the job counts the distinct progress minutes logged since
+the start of the subscriber's current run (any device, any visit). The marks
+required are every 10-minute mark at or before <pitch-second>; up to
+<allowed-missing-marks> of them may be missing. The reached_pitch row is marked
+qualified = true/false, with missing_marks listing any that were missing. Only
+a qualified pitch is tagged and counted. Someone with no run on record can't
+qualify: the pitch is logged as not qualified and admin is emailed.
 
 A "run" is one watch-and-purchase window. It starts with a registration made
 while no window was open; evergreen-sms-webinar-registration marks that
@@ -31,8 +44,7 @@ included, but the count only goes up once per run: the job finds the latest
 'registered' row with new_run = true and marks it pitch_counted_at. DynamoDB
 accepts only the first mark, so a re-watch during the cart window, a second tab
 or a retried job can't count twice. If Kit then fails in a way worth retrying,
-the mark is removed so the retry can count it. Someone with no run on record
-is logged and tagged but not counted, and admin is emailed.
+the mark is removed so the retry can count it.
 
 How it works - the function runs in two modes:
 
@@ -43,7 +55,8 @@ How it works - the function runs in two modes:
    the page and can't lose a milestone.
 
 2. JOB MODE (the background run)
-   Applies the milestone's tags and, once per run, increments the watch count in Kit. If Kit is
+   Qualifies a reached_pitch, applies the milestone's tags and, once per run,
+   increments the watch count in Kit. If Kit is
    busy (429) or broken (5xx), or the network fails, the job raises an error and
    Lambda retries it automatically. If every retry fails, Lambda sends the failed
    job to the "on failure" SNS destination, which emails admin.
@@ -61,8 +74,13 @@ and the function refuses to run if any of these is missing:
   This function's own, String, under PARAM_PREFIX + "evergreen-watch/":
     allowed-origin              the watch page's website, e.g. https://www.example.com
     started-tag-id              Kit tag ID for "started watching"
-    watched-tag-id              Kit tag ID for "reached the pitch"
+    watched-tag-id              Kit tag ID for "reached the pitch, having watched properly"
+    clicked-tag-id              Kit tag ID for "clicked the buy button"
     watch-count-field           Kit custom field key for the lifetime watch count
+    pitch-second                when the pitch starts, in seconds from the start of the
+                                video. MUST match T_PITCH in the watch page script
+    allowed-missing-marks       how many of the 10-minute marks before the pitch may be
+                                missing and still count as watching properly, e.g. 1
 
 Lambda environment variables (all optional except FAILURE_TOPIC_ARN):
   FAILURE_TOPIC_ARN     SNS topic for failure emails
@@ -103,7 +121,7 @@ JOB_NAME = "kit_actions"
 FAIL_EMAIL_SUBJECT = "Evergreen watch: failure"
 MAX_BODY_BYTES = 2000
 
-MILESTONES = ("started", "progress", "reached_pitch")
+MILESTONES = ("started", "progress", "reached_pitch", "cta_click")
 
 _clients = {}
 _settings = None
@@ -122,7 +140,7 @@ def lambda_handler(event, context):
         return handle_page_call(event, context)
 
     if event.get("job") == JOB_NAME:
-        run_kit_actions(event.get("subscriber_id"), event.get("milestone"))
+        run_kit_actions(event.get("subscriber_id"), event.get("milestone"), event.get("event_at"))
         return {"ok": True}
 
     logger.error("Unrecognised event: %s", json.dumps(event)[:1000])
@@ -173,7 +191,7 @@ def handle_page_call(event, context):
         return respond(403, "Forbidden")
 
     try:
-        log_event(subscriber_id, milestone, minute)
+        event_at = log_event(subscriber_id, milestone, minute)
     except Exception as error:
         notify_failure(f"Could not write {milestone} event for subscriber {subscriber_id} "
                        f"to {EVENTS_TABLE}: {error}")
@@ -186,7 +204,7 @@ def handle_page_call(event, context):
                 FunctionName=context.invoked_function_arn,
                 InvocationType="Event",
                 Payload=json.dumps({"job": JOB_NAME, "subscriber_id": subscriber_id,
-                                    "milestone": milestone}).encode("utf-8"),
+                                    "milestone": milestone, "event_at": event_at}).encode("utf-8"),
             )
         except Exception as error:
             # The event is already logged; only the Kit update is missing
@@ -214,7 +232,7 @@ def read_body(event):
 
 
 def log_event(subscriber_id, event_type, minute=None):
-    """Write one row to the event log."""
+    """Write one row to the event log. Returns its event_at (the row's sort key)."""
     now = datetime.now(timezone.utc)
     item = {
         "subscriber_id": subscriber_id,
@@ -227,6 +245,7 @@ def log_event(subscriber_id, event_type, minute=None):
     if minute is not None:
         item["minute"] = minute
     events_table().put_item(Item=item)
+    return item["event_at"]
 
 
 def respond(status_code, message):
@@ -245,19 +264,27 @@ def respond(status_code, message):
 def milestone_actions(milestone, cfg):
     """What each milestone is allowed to do. This is the allow-list: nothing else can be tagged or incremented."""
     return {
-        "started": {"tags": [cfg["started_tag_id"]], "increment": None},
-        "progress": {"tags": [], "increment": None},
-        "reached_pitch": {"tags": [cfg["watched_tag_id"]], "increment": cfg["watch_count_field"]},
+        "started": {"tags": [cfg["started_tag_id"]], "increment": None, "qualify": False},
+        "progress": {"tags": [], "increment": None, "qualify": False},
+        "reached_pitch": {"tags": [cfg["watched_tag_id"]], "increment": cfg["watch_count_field"], "qualify": True},
+        "cta_click": {"tags": [cfg["clicked_tag_id"]], "increment": None, "qualify": False},
     }[milestone]
 
 
-def run_kit_actions(subscriber_id, milestone):
+def run_kit_actions(subscriber_id, milestone, event_at=None):
     if milestone not in MILESTONES or not str(subscriber_id or "").isdigit():
         notify_failure(f"Background job received bad input: subscriber {subscriber_id!r}, milestone {milestone!r}")
         return
 
     cfg = settings()  # an exception here makes Lambda retry
     actions = milestone_actions(milestone, cfg)
+
+    if actions["qualify"]:
+        if not isinstance(event_at, str) or not event_at:
+            notify_failure(f"Background job for {milestone} (subscriber {subscriber_id}) had no event_at")
+            return
+        if not pitch_qualifies(subscriber_id, event_at, cfg):
+            return  # logged as not qualified: no tag, no count
 
     for tag_id in actions["tags"]:
         tag_subscriber(subscriber_id, tag_id, cfg["kit_api_key"])
@@ -267,12 +294,69 @@ def run_kit_actions(subscriber_id, milestone):
         count_once_per_run(subscriber_id, actions["increment"], cfg["kit_api_key"])
 
 
+def required_marks(pitch_second):
+    """The 10-minute marks at or before the pitch, e.g. pitch at 4329 s -> [10, 20, ..., 70]."""
+    return [m for m in range(PROGRESS_STEP, MAX_PROGRESS_MINUTE + 1, PROGRESS_STEP) if m * 60 <= pitch_second]
+
+
+def pitch_qualifies(subscriber_id, event_at, cfg):
+    """
+    Decide whether this reached_pitch counts as watching properly, and record the
+    decision on its row. True if they played through enough 10-minute marks in their current run.
+    """
+    run_start = latest_run_start(subscriber_id)  # a DynamoDB error here makes Lambda retry
+    if run_start is None:
+        record_qualified(subscriber_id, event_at, False, None)
+        notify_failure(f"Subscriber {subscriber_id} reached the pitch with no run on record (no registration "
+                       f"that started a watch-and-purchase window). Logged as not qualified: not tagged, not counted.")
+        return False
+
+    played = progress_minutes_since(subscriber_id, run_start)
+    missing = [m for m in required_marks(int(cfg["pitch_second"])) if m not in played]
+    qualified = len(missing) <= int(cfg["allowed_missing_marks"])
+    record_qualified(subscriber_id, event_at, qualified, missing)
+    logger.info("Pitch for subscriber %s %s (missing marks: %s)", subscriber_id,
+                "qualified" if qualified else "not qualified", missing or "none")
+    return qualified
+
+
+def progress_minutes_since(subscriber_id, since_event_at):
+    """The distinct progress minutes logged for this subscriber at or after since_event_at."""
+    query = {
+        "KeyConditionExpression": Key("subscriber_id").eq(subscriber_id) & Key("event_at").gte(since_event_at),
+        "FilterExpression": Attr("event").eq("progress"),
+        "ProjectionExpression": "#m",
+        "ExpressionAttributeNames": {"#m": "minute"},
+    }
+    minutes = set()
+    while True:
+        page = events_table().query(**query)
+        minutes.update(int(item["minute"]) for item in page.get("Items", []) if "minute" in item)
+        if "LastEvaluatedKey" not in page:
+            return minutes
+        query["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def record_qualified(subscriber_id, event_at, qualified, missing):
+    """Record on the reached_pitch row whether it counted, and which marks were missing."""
+    values = {":q": qualified}
+    expression = "SET qualified = :q"
+    if missing is not None:
+        expression += ", missing_marks = :mm"
+        values[":mm"] = missing
+    events_table().update_item(
+        Key={"subscriber_id": subscriber_id, "event_at": event_at},
+        UpdateExpression=expression,
+        ConditionExpression="attribute_exists(event_at)",
+        ExpressionAttributeValues=values,
+    )
+
+
 def count_once_per_run(subscriber_id, field, api_key):
     """Add 1 to the watch count, unless this subscriber's current run has already been counted."""
     registration = latest_run_start(subscriber_id)  # a DynamoDB error here makes Lambda retry
     if registration is None:
-        notify_failure(f"Subscriber {subscriber_id} reached the pitch with no run on record (no registration "
-                       f"that started a watch-and-purchase window). Logged and tagged, but {field} was not increased.")
+        notify_failure(f"Subscriber {subscriber_id} has no run on record, so {field} was not increased.")
         return
     if not mark_pitch_counted(subscriber_id, registration):
         logger.info("Run starting %s for subscriber %s already counted for %s", registration, subscriber_id, field)
@@ -414,7 +498,10 @@ def settings():
             "allowed_origin": own + "allowed-origin",
             "started_tag_id": own + "started-tag-id",
             "watched_tag_id": own + "watched-tag-id",
+            "clicked_tag_id": own + "clicked-tag-id",
             "watch_count_field": own + "watch-count-field",
+            "pitch_second": own + "pitch-second",
+            "allowed_missing_marks": own + "allowed-missing-marks",
         }
         response = ssm_client().get_parameters(Names=list(names.values()), WithDecryption=True)
         found = {p["Name"]: p["Value"] for p in response["Parameters"]}
@@ -422,9 +509,15 @@ def settings():
         if missing:
             raise RuntimeError(f"Missing or empty parameters: {', '.join(missing)}")
         loaded = {key: found[name].strip() for key, name in names.items()}
-        for key in ("started_tag_id", "watched_tag_id"):
+        for key in ("started_tag_id", "watched_tag_id", "clicked_tag_id"):
             if not loaded[key].isdigit():
                 raise RuntimeError(f"{names[key]} must be a Kit tag ID (digits only), got {loaded[key]!r}")
+        if not loaded["pitch_second"].isdigit() or not 0 < int(loaded["pitch_second"]) <= MAX_PROGRESS_MINUTE * 60:
+            raise RuntimeError(f"{names['pitch_second']} must be a whole number of seconds, "
+                               f"at most {MAX_PROGRESS_MINUTE * 60}, got {loaded['pitch_second']!r}")
+        if not loaded["allowed_missing_marks"].isdigit():
+            raise RuntimeError(f"{names['allowed_missing_marks']} must be a whole number (0 or more), "
+                               f"got {loaded['allowed_missing_marks']!r}")
         if not loaded["allowed_origin"].startswith("https://"):
             raise RuntimeError(f"{names['allowed_origin']} must start with https://, got {loaded['allowed_origin']!r}")
         _settings = loaded

@@ -1,0 +1,164 @@
+<!--
+  Evergreen SMS webinar: watch page block (video, tracking and buy button)
+
+  Paste this whole file into ONE Kajabi "Custom Code" block on the watch page.
+  The page address must carry the subscriber's token: ...?indiv_token=XXXX
+  (In Kit emails: ?indiv_token={{ subscriber.indiv_token }})
+
+  Only edit the SETTINGS section below.
+-->
+
+<div id="eg-video"></div>
+
+<div id="eg-cta" hidden>
+  <p class="eg-cta-intro"><em>YOUR INTRODUCTION TO THE BUTTON</em></p>
+  <a id="eg-buy" class="eg-buy" href="#">YOUR BUTTON TEXT</a>
+</div>
+
+<style>
+  #eg-video .wistia_responsive_wrapper { position: relative; aspect-ratio: 16 / 9; }
+  #eg-cta { text-align: center; padding: 24px 0; }
+  #eg-cta[hidden] { display: none; }
+  .eg-buy {
+    display: inline-block; padding: 16px 32px; border-radius: 999px;
+    background: #fcb900; color: #000; font-weight: 700; font-size: 1.25rem;
+    text-decoration: none; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  }
+  .eg-buy:hover { filter: brightness(0.95); }
+</style>
+
+<script>
+(function () {
+  /* ======================= SETTINGS: edit these only ======================= */
+
+  // Where milestones are sent: your evergreen-sms-webinar-watch Function URL, then "milestone"
+  var MILESTONE_URL = "https://YOUR-FUNCTION-URL.lambda-url.REGION.on.aws/milestone";
+
+  // The Wistia video ID (from the Wistia embed code)
+  var VIDEO_ID = "YOUR-WISTIA-VIDEO-ID";
+
+  // Seconds of real playback before "started" is sent (stops auto-play counting)
+  var T_START = 30;
+
+  // When the pitch starts, in seconds from the start of the video (72:09 = 4329).
+  // !!! Must ALSO be changed in Parameter Store: /zki/evergreen-watch/pitch-second !!!
+  var T_PITCH = 4329;
+
+  // How often a progress mark is logged, in seconds. Keep at 600 (every 10 minutes):
+  // Lambda only accepts marks at 10, 20, 30... minutes.
+  var LOG_EVERY = 600;
+
+  // Where the buy button goes (the subscriber's token is added automatically)
+  var SALES_URL = "https://YOUR-SALES-PAGE-ADDRESS";
+
+  /* ===================== Nothing below needs editing ===================== */
+
+  // A jump of more than this many seconds between position updates means the
+  // viewer dragged the video, so it doesn't count as watching. 3 allows for 2x speed.
+  var MAX_STEP = 3;
+
+  var token = new URLSearchParams(window.location.search).get("indiv_token");
+  var sent = {};          // what has been sent on this page load
+  var lastSecond = null;  // video position at the previous update
+  var played = 0;         // seconds actually played on this page load
+
+  if (!token) {
+    console.log("Watch page: no indiv_token in the address, so viewing isn't recorded.");
+  }
+
+  // ---- Sending milestones ----
+
+  function send(milestone, extra, isRetry) {
+    if (!token) return;
+    var body = { token: token, milestone: milestone };
+    for (var key in extra) body[key] = extra[key];
+    fetch(MILESTONE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      keepalive: true // finish sending even if the viewer leaves the page
+    }).then(function (response) {
+      // Retry once on a temporary server problem; never on a refusal (4xx)
+      if (response.status >= 500 && !isRetry) retryLater(milestone, extra);
+    }).catch(function () {
+      if (!isRetry) retryLater(milestone, extra); // network problem
+    });
+  }
+
+  function retryLater(milestone, extra) {
+    setTimeout(function () { send(milestone, extra, true); }, 5000);
+  }
+
+  function sendOnce(key, milestone, extra) {
+    if (sent[key]) return;
+    sent[key] = true;
+    send(milestone, extra || {});
+  }
+
+  // ---- Buy button ----
+
+  var cta = document.getElementById("eg-cta");
+  var buy = document.getElementById("eg-buy");
+  var salesLink = SALES_URL;
+  if (token) {
+    salesLink += (SALES_URL.indexOf("?") === -1 ? "?" : "&") + "indiv_token=" + encodeURIComponent(token);
+  }
+  buy.href = salesLink;
+  buy.addEventListener("click", function () {
+    // Don't stop the link: the sales page opens straight away while this is sent
+    sendOnce("cta_click", "cta_click");
+  });
+
+  function revealBuyButton() {
+    cta.hidden = false;
+  }
+
+  // ---- Video ----
+
+  var holder = document.getElementById("eg-video");
+  holder.innerHTML =
+    '<div class="wistia_responsive_wrapper">' +
+    '<div class="wistia_embed wistia_async_' + VIDEO_ID + ' seo=false videoFoam=true" ' +
+    'style="height:100%;position:relative;width:100%"></div></div>';
+  [
+    "https://fast.wistia.com/embed/medias/" + VIDEO_ID + ".jsonp",
+    "https://fast.wistia.com/assets/external/E-v1.js"
+  ].forEach(function (src) {
+    var script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    document.head.appendChild(script);
+  });
+
+  window._wq = window._wq || [];
+  window._wq.push({
+    id: VIDEO_ID,
+    onReady: function (video) {
+      video.bind("secondchange", function (second) {
+        var step = lastSecond === null ? null : second - lastSecond;
+        var watching = step !== null && step > 0 && step <= MAX_STEP && video.state() === "playing";
+
+        if (watching) {
+          played += step;
+          if (played >= T_START) sendOnce("started", "started");
+
+          // Progress marks the video has just PLAYED across (dragging past them doesn't count)
+          for (var mark = Math.floor(lastSecond / LOG_EVERY) + 1; mark * LOG_EVERY <= second; mark++) {
+            var minute = mark * LOG_EVERY / 60;
+            sendOnce("progress-" + minute, "progress", { minute: minute });
+          }
+        }
+
+        // Reaching the pitch by any route reveals the button. Lambda decides,
+        // from the progress marks, whether it counts as having watched properly.
+        if (second >= T_PITCH) {
+          revealBuyButton();
+          sendOnce("reached_pitch", "reached_pitch");
+        }
+
+        lastSecond = second;
+      });
+    }
+  });
+})();
+</script>

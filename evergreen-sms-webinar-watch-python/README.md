@@ -29,9 +29,10 @@ flowchart TD
 
 | Milestone | When the page sends it | Kit | Event log |
 |---|---|---|---|
-| `started` | 30 seconds of playback, so auto-play alone doesn't count | tag `started-tag-id` | ✅ |
-| `progress` | every 10 minutes: `minute` 10, 20, 30… | nothing | ✅ with the minute |
-| `reached_pitch` | the pitch timestamp | tag `watched-tag-id`, then add 1 to `watch-count-field`, **once per run** | ✅ |
+| `started` | 30 seconds actually played, so auto-play alone doesn't count | tag `started-tag-id` | ✅ |
+| `progress` | the video **plays across** 10:00, 20:00, 30:00… (not when dragged past): `minute` 10, 20, 30… | nothing | ✅ with the minute |
+| `reached_pitch` | the position reaches the pitch, however they got there | **only if they watched properly** (below): tag `watched-tag-id`, then add 1 to `watch-count-field`, **once per run** | ✅ with `qualified` |
+| `cta_click` | the buy button is clicked | tag `clicked-tag-id` (starts the cart for people who skipped ahead) | ✅ |
 
 The page sends:
 
@@ -39,7 +40,10 @@ The page sends:
 { "token": "<indiv_token>", "milestone": "started" }
 { "token": "<indiv_token>", "milestone": "progress", "minute": 20 }
 { "token": "<indiv_token>", "milestone": "reached_pitch" }
+{ "token": "<indiv_token>", "milestone": "cta_click" }
 ```
+
+The page itself is in [`watch-page/`](watch-page/), with its own README.
 
 The replies are:
 - `200`: recorded.
@@ -50,6 +54,27 @@ The replies are:
 A blank or non-numeric watch count counts as 0. The tag IDs, field name and
 allowed website all come from Parameter Store (step 2 below), so none of them
 appear in the code or this guide.
+
+## Watched properly ("qualified")
+
+The watch page only sends a `progress` mark when the video actually plays
+across it, not when someone drags past it. When `reached_pitch` arrives, the
+background job counts the **distinct** `progress` minutes logged since the start
+of the subscriber's **current run**, from any visit and any device.
+
+- The marks required are every 10-minute mark at or before `pitch-second`
+  (pitch at 72:09 → 10, 20 … 70: seven marks).
+- Up to `allowed-missing-marks` of them may be missing (e.g. 1: six of seven
+  is enough), so someone can skip a stretch they've seen before.
+- The `reached_pitch` row is marked `qualified` true or false, with
+  `missing_marks` listing any that were missing.
+- **Qualified:** "watched" tag, watch count (once per run), and the cart starts.
+- **Not qualified:** no tag and no count. The page still shows the buy button,
+  and clicking it (`cta_click`) starts the cart through the "clicked buy" tag.
+- **No run on record:** can't qualify; logged as not qualified, and admin is emailed.
+
+Someone who drags to the pitch, then later goes back and watches the missing
+stretches, qualifies on their next `reached_pitch`.
 
 ## The watch count: once per run
 
@@ -71,9 +96,7 @@ buying. It can never exceed the registration count, which counts runs started.
   made the mark adds 1.
 - **If Kit is busy** when saving the count, the mark is removed again, so
   Lambda's automatic retry can count it.
-- **No run on record** (e.g. a subscriber who never used the registration form,
-  or whose registrations all predate run tracking): the event is logged and
-  tagged, but not counted, and admin is emailed.
+- **Only qualified pitches count** (see above).
 
 ## The event log: table `evergreen_events`
 
@@ -81,8 +104,10 @@ buying. It can never exceed the registration count, which counts runs started.
 |---|---|---|
 | `subscriber_id` | `1234567890` | partition key |
 | `event_at` | `2026-11-06T14:12:03.123Z#a1b2c3` | sort key: UTC time, plus a random suffix so two events in the same millisecond don't collide |
-| `event` | `started`, `progress`, `reached_pitch` | |
+| `event` | `started`, `progress`, `reached_pitch`, `cta_click` | |
 | `minute` | `20` | `progress` only |
+| `qualified` | `true` | `reached_pitch` only: whether they watched properly |
+| `missing_marks` | `[70]` | `reached_pitch` only: the required marks they hadn't played through |
 | `source` | `watch_page` | |
 | `pitch_counted_at` | `2026-11-07T10:20:01+00:00` | on `registered` rows only: set when that registration's watch has been counted |
 
@@ -100,6 +125,8 @@ event types (registrations, sales page visits, purchases) to the same table.
 | `lambda_function.py` | The function |
 | `kit_token.py` | Reads tokens. Identical to the copy in `kit-set-indiv-token-python`: keep them the same |
 | `test_lambda_function.py` | Tests (`python3 -m unittest -v`). No AWS or Kit needed. The event log tests also need `pip install "moto[dynamodb]"`, and are skipped without it |
+| `watch-page/watch-page.html` | The watch page block: video, tracking and buy button. Paste into a Kajabi Custom Code block |
+| `watch-page/README.md` | How the page works, its settings, and how to test it in a browser |
 
 It needs the same `cryptography-py313-arm64` layer as `kit-set-indiv-token`.
 
@@ -128,6 +155,9 @@ in **Systems Manager → Parameter Store**, each with **Tier: Standard** and
 | `/zki/evergreen-watch/started-tag-id` | ID of the Kit tag for "started watching" |
 | `/zki/evergreen-watch/watched-tag-id` | ID of the Kit tag for "reached the pitch" |
 | `/zki/evergreen-watch/watch-count-field` | Key of the Kit custom field holding the lifetime watch count |
+| `/zki/evergreen-watch/clicked-tag-id` | ID of the Kit tag for "clicked the buy button" |
+| `/zki/evergreen-watch/pitch-second` | When the pitch starts, in seconds (e.g. 4329 for 72:09). **Must match `T_PITCH` in the watch page**: change both together |
+| `/zki/evergreen-watch/allowed-missing-marks` | How many 10-minute marks before the pitch may be missing, e.g. `1` |
 
 To find a tag's ID in Kit, open the tag: the ID is the number at the end of the
 page address. A custom field's key is shown in Kit's custom field settings.
@@ -245,33 +275,39 @@ Use a test subscriber whose latest registration **started a run** (a
 if not), and their **current** `indiv_token` from Kit. Before you start, remove the
 "started" and "reached the pitch" tags from them and note their watch count.
 
-In Postman, POST to `…on.aws/milestone` with body type raw → JSON:
+In Postman, POST to `…on.aws/milestone` with body type raw → JSON. With the
+pitch at 72:09 and one missing mark allowed:
 
 | # | Body | Expect |
 |---|---|---|
 | 1 | `{"token": "TOKEN", "milestone": "started"}` | `200`. Within seconds, the subscriber has the "started" tag |
 | 2 | `{"token": "TOKEN", "milestone": "progress", "minute": 10}` | `200`. Nothing changes in Kit |
-| 3 | `{"token": "TOKEN", "milestone": "reached_pitch"}` | `200`. They have the "reached the pitch" tag, and the watch count has gone up by 1 |
-| 3a | the same as 3, again | `200`. Another `reached_pitch` row, but the watch count does **not** go up |
-| 4 | `{"token": "TOKEN", "milestone": "progress", "minute": 15}` | `400` |
-| 5 | `{"token": "TOKEN", "milestone": "purchased"}` | `400` |
-| 6 | `{"token": "TOKEN-WITH-ONE-LETTER-CHANGED", "milestone": "started"}` | `403` |
+| 3 | `{"token": "TOKEN", "milestone": "reached_pitch"}` | `200`. **Not qualified** (only one mark): the row shows `qualified` false; no tag, no count |
+| 4 | `{"token": "TOKEN", "milestone": "cta_click"}` | `200`. They have the "clicked buy" tag |
+| 5 | call 2 again with `minute` 20, 30, 40, 50 and 60, then call 3 | **Qualified** (only 70 missing): "watched" tag, and the watch count goes up by 1 |
+| 6 | call 3 again | `200`. Another qualified row, but the watch count does **not** go up (once per run) |
+| 7 | `{"token": "TOKEN", "milestone": "progress", "minute": 15}` | `400` |
+| 8 | `{"token": "TOKEN", "milestone": "purchased"}` | `400` |
+| 9 | `{"token": "TOKEN-WITH-ONE-LETTER-CHANGED", "milestone": "started"}` | `403` |
 
-Then check the log: **DynamoDB** → **Explore items** → `evergreen_events`. There
-should be four new rows for the subscriber's ID (`started`, `progress` with minute 10,
-and two `reached_pitch`), and none for calls 4–6. The `registered` row that
-started their run should now have `pitch_counted_at`.
+Then check the log: **DynamoDB** → **Explore items** → `evergreen_events`. The
+`reached_pitch` rows show `qualified` and `missing_marks`, there's a `cta_click`
+row, there are no rows for calls 7–9, and the `registered` row that started the
+run has `pitch_counted_at`.
 
 **Re-registering within the run.** Give the test subscriber the cart-window tag
 by hand, submit the registration form, then repeat call 3: the watch count does
 **not** go up (the registration was logged with `new_run` false).
 
-**A new run.** Remove both window tags, submit the registration form again,
-then repeat call 3: the watch count goes up by 1.
+**A new run.** Remove both window tags and submit the registration form again.
+The new run has no progress marks yet, so call 3 is **not** qualified until you
+repeat calls 2 and 5; then the watch count goes up by 1.
 
 **No run.** Repeat call 3 with the token of a subscriber who has never used the
-registration form: `200` and the tag, but no change to their watch count, and a
-failure email saying they had no run on record.
+registration form: `200`, not qualified, no tag, no change to their watch
+count, and a failure email saying they had no run on record.
+
+To test the real page in a browser, see [`watch-page/README.md`](watch-page/README.md).
 
 **Website check.** Open any other website (e.g. `https://example.com`), open the
 browser's developer console (View → Developer → JavaScript Console in Chrome)

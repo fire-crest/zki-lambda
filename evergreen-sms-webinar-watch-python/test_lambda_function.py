@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import urlsplit
 
+from botocore.exceptions import ClientError
+
 import kit_token
 import lambda_function as fn
 
@@ -33,6 +35,9 @@ TEST_SETTINGS = {
     "started_tag_id": os.environ.get("TEST_STARTED_TAG_ID", "1000001"),
     "watched_tag_id": os.environ.get("TEST_WATCHED_TAG_ID", "1000002"),
     "watch_count_field": os.environ.get("TEST_WATCH_COUNT_FIELD", "test_watch_count"),
+    "clicked_tag_id": os.environ.get("TEST_CLICKED_TAG_ID", "1000003"),
+    "pitch_second": os.environ.get("TEST_PITCH_SECOND", "4329"),          # 72:09 -> marks 10..70
+    "allowed_missing_marks": os.environ.get("TEST_ALLOWED_MISSING_MARKS", "1"),
 }
 SUB = os.environ.get("TEST_SUBSCRIBER_ID", "1234567890")
 
@@ -44,6 +49,10 @@ ORIGIN = TEST_SETTINGS["allowed_origin"]
 STARTED_TAG = TEST_SETTINGS["started_tag_id"]
 WATCHED_TAG = TEST_SETTINGS["watched_tag_id"]
 COUNT_FIELD = TEST_SETTINGS["watch_count_field"]
+CLICKED_TAG = TEST_SETTINGS["clicked_tag_id"]
+PITCH_SECOND = int(TEST_SETTINGS["pitch_second"])
+ALLOWED_MISSING = int(TEST_SETTINGS["allowed_missing_marks"])
+ALL_MARKS = set(range(10, PITCH_SECOND // 60 + 1, 10))
 CONTEXT = SimpleNamespace(invoked_function_arn="arn:aws:lambda:eu-north-1:111:function:test-function")
 
 
@@ -102,7 +111,8 @@ class PageTests(unittest.TestCase):
         self.assertEqual((row["subscriber_id"], row["event"], row["source"]), (SUB, "started", "watch_page"))
         self.assertNotIn("minute", row)
         self.assertRegex(row["event_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z#[0-9a-f]{6}$")
-        self.assertEqual(self.jobs(), [{"job": "kit_actions", "subscriber_id": SUB, "milestone": "started"}])
+        self.assertEqual(self.jobs(), [{"job": "kit_actions", "subscriber_id": SUB, "milestone": "started",
+                                        "event_at": row["event_at"]}])
         self.assertEqual(self.lambda_client.return_value.invoke.call_args.kwargs["InvocationType"], "Event")
 
     def test_progress_logs_minute_and_never_touches_kit(self):
@@ -112,9 +122,16 @@ class PageTests(unittest.TestCase):
         self.assertEqual((row["event"], row["minute"]), ("progress", 30))
         self.assertEqual(self.jobs(), [])
 
-    def test_pitch_starts_kit_job(self):
+    def test_pitch_starts_kit_job_with_its_row(self):
         self.call({"token": TOKEN, "milestone": "reached_pitch"})
-        self.assertEqual(self.jobs()[0]["milestone"], "reached_pitch")
+        [row] = self.logged()
+        self.assertEqual((self.jobs()[0]["milestone"], self.jobs()[0]["event_at"]), ("reached_pitch", row["event_at"]))
+
+    def test_cta_click_logged_and_starts_kit_job(self):
+        self.assertEqual(self.call({"token": TOKEN, "milestone": "cta_click"})["statusCode"], 200)
+        [row] = self.logged()
+        self.assertEqual(row["event"], "cta_click")
+        self.assertEqual(self.jobs()[0]["milestone"], "cta_click")
 
     def test_bad_progress_minutes_refused(self):
         for minute in [0, -10, 15, 250, "20", 20.0, True, None]:
@@ -131,7 +148,9 @@ class PageTests(unittest.TestCase):
     def test_page_cannot_choose_tags_or_fields(self):
         self.call({"token": TOKEN, "milestone": "started", "tag": 999, "tags": [999],
                    "field": "payment_plan", "increment": "payment_plan"})
-        self.assertEqual(self.jobs(), [{"job": "kit_actions", "subscriber_id": SUB, "milestone": "started"}])
+        [job] = self.jobs()
+        self.assertEqual(set(job), {"job", "subscriber_id", "milestone", "event_at"})
+        self.assertEqual(job["milestone"], "started")
 
     def test_bad_tokens_refused(self):
         tampered = TOKEN[:-1] + ("A" if TOKEN[-1] != "A" else "B")
@@ -205,6 +224,7 @@ class FakeKit:
 
 
 REGISTRATION = "2026-01-01T12:00:00.000Z#abc123"
+PITCH_ROW = "2026-01-01T13:15:00.000Z#fff000"
 
 
 class JobTests(unittest.TestCase):
@@ -213,12 +233,18 @@ class JobTests(unittest.TestCase):
     def setUp(self):
         self.registration = REGISTRATION
         self.marks = set()
+        self.played = set(ALL_MARKS)      # progress marks played through in the current run
+        self.recorded = []                # (event_at, qualified, missing) written to reached_pitch rows
         patchers = [mock.patch.object(fn, "settings", return_value=SECRETS),
                     mock.patch.object(fn, "notify_failure"),
                     mock.patch.object(fn, "latest_run_start", side_effect=lambda s: self.registration),
                     mock.patch.object(fn, "mark_pitch_counted", side_effect=self.fake_mark),
-                    mock.patch.object(fn, "unmark_pitch_counted", side_effect=lambda s, r: self.marks.discard((s, r)))]
-        self.settings, self.notify, self.latest, self.mark, self.unmark = [p.start() for p in patchers]
+                    mock.patch.object(fn, "unmark_pitch_counted", side_effect=lambda s, r: self.marks.discard((s, r))),
+                    mock.patch.object(fn, "progress_minutes_since", side_effect=lambda s, since: set(self.played)),
+                    mock.patch.object(fn, "record_qualified",
+                                      side_effect=lambda s, e, q, m: self.recorded.append((e, q, m)))]
+        self.settings, self.notify, self.latest, self.mark, self.unmark, self.progress, self.record = \
+            [p.start() for p in patchers]
         for p in patchers:
             self.addCleanup(p.stop)
 
@@ -228,9 +254,10 @@ class JobTests(unittest.TestCase):
         self.marks.add((subscriber_id, registration))
         return True
 
-    def run_job(self, kit, milestone="reached_pitch", subscriber_id=SUB):
+    def run_job(self, kit, milestone="reached_pitch", subscriber_id=SUB, event_at=PITCH_ROW):
         with mock.patch.object(fn, "kit_request", side_effect=kit):
-            fn.lambda_handler({"job": "kit_actions", "subscriber_id": subscriber_id, "milestone": milestone}, CONTEXT)
+            fn.lambda_handler({"job": "kit_actions", "subscriber_id": subscriber_id, "milestone": milestone,
+                               "event_at": event_at}, CONTEXT)
 
     def test_started_tags_only(self):
         kit = FakeKit()
@@ -272,14 +299,70 @@ class JobTests(unittest.TestCase):
         self.run_job(kit)
         self.assertEqual(kit.fields[COUNT_FIELD], "6")
 
-    def test_no_run_logged_tagged_not_counted_and_reported(self):
+    def test_no_run_not_qualified_not_tagged_and_reported(self):
         self.registration = None
         kit = FakeKit(count="4")
         self.run_job(kit)
-        self.assertEqual(kit.calls, [("POST", f"tags/{WATCHED_TAG}/subscribers/{SUB}")])
-        self.assertEqual(kit.fields[COUNT_FIELD], "4")
+        self.assertEqual(kit.calls, [])
+        self.assertEqual(self.recorded, [(PITCH_ROW, False, None)])
         self.notify.assert_called_once()
         self.assertIn("no run on record", self.notify.call_args.args[0])
+
+    def test_watched_properly_qualifies(self):
+        kit = FakeKit(count="0")
+        self.run_job(kit)
+        self.assertEqual(self.recorded, [(PITCH_ROW, True, [])])
+        self.assertEqual(kit.fields[COUNT_FIELD], "1")
+
+    def test_allowed_number_of_missing_marks_still_qualifies(self):
+        self.played = set(sorted(ALL_MARKS)[ALLOWED_MISSING:])  # skipped the first stretch(es)
+        kit = FakeKit(count="0")
+        self.run_job(kit)
+        self.assertTrue(self.recorded[0][1])
+        self.assertEqual(self.recorded[0][2], sorted(ALL_MARKS)[:ALLOWED_MISSING])
+        self.assertEqual(kit.fields[COUNT_FIELD], "1")
+
+    def test_too_many_missing_marks_not_qualified(self):
+        self.played = set(sorted(ALL_MARKS)[ALLOWED_MISSING + 1:])
+        kit = FakeKit(count="0")
+        self.run_job(kit)
+        self.assertEqual(self.recorded[0][:2], (PITCH_ROW, False))
+        self.assertEqual(kit.calls, [])  # no tag, no count
+        self.notify.assert_not_called()  # skipping is allowed, not an error
+
+    def test_dragged_straight_to_pitch_not_qualified(self):
+        self.played = {10}
+        kit = FakeKit(count="0")
+        self.run_job(kit)
+        self.assertFalse(self.recorded[0][1])
+        self.assertEqual(kit.calls, [])
+
+    def test_marks_beyond_the_pitch_do_not_help(self):
+        self.played = {80, 90, 100, 110, 120, 130, 140}
+        self.run_job(FakeKit(count="0"))
+        self.assertFalse(self.recorded[0][1])
+
+    def test_watching_the_rest_later_then_qualifies(self):
+        self.played = {10, 20}
+        kit = FakeKit(count="0")
+        self.run_job(kit)               # dragged to the pitch early: not qualified
+        self.played = set(ALL_MARKS)    # came back and watched properly
+        self.run_job(kit, event_at="2026-01-02T10:00:00.000Z#aaa111")
+        self.assertEqual([r[1] for r in self.recorded], [False, True])
+        self.assertEqual(kit.fields[COUNT_FIELD], "1")
+
+    def test_pitch_without_event_at_reported(self):
+        kit = FakeKit()
+        self.run_job(kit, event_at=None)
+        self.assertEqual(kit.calls, [])
+        self.notify.assert_called_once()
+
+    def test_cta_click_tags_clicked_only(self):
+        kit = FakeKit(count="4")
+        self.run_job(kit, "cta_click")
+        self.assertEqual(kit.calls, [("POST", f"tags/{CLICKED_TAG}/subscribers/{SUB}")])
+        self.assertEqual(kit.fields[COUNT_FIELD], "4")
+        self.progress.assert_not_called()
 
     def test_kit_busy_on_count_unmarks_so_retry_counts(self):
         kit = FakeKit(count="4", fail={("PUT", "subscribers"): (429, "busy")})
@@ -299,6 +382,7 @@ class JobTests(unittest.TestCase):
         self.run_job(FakeKit(), "started")
         self.latest.assert_not_called()
         self.mark.assert_not_called()
+        self.record.assert_not_called()
 
     def test_kit_busy_retries_before_counting(self):
         for status in [429, 500, 503]:
@@ -400,6 +484,42 @@ class EventLogTests(unittest.TestCase):
                                          "counted_at": "2026-01-01T12:00:01+00:00"})
         self.assertTrue(fn.mark_pitch_counted(SUB, REGISTRATION))
 
+    def test_progress_minutes_since_run_start(self):
+        self.put(SUB, "2026-01-01T10:10:00.000Z#a", "progress")           # previous run: ignored
+        self.put(SUB, "2026-01-03T09:00:00.000Z#run", "registered", True)
+        self.put(SUB, "2026-01-03T09:10:00.000Z#b", "progress")
+        self.put(SUB, "2026-01-03T09:20:00.000Z#c", "progress")
+        self.put(SUB, "2026-01-04T08:10:00.000Z#d", "progress")           # watched 10 again next day
+        self.put(SUB, "2026-01-04T08:12:00.000Z#e", "started")
+        self.put("999", "2026-01-03T09:30:00.000Z#f", "progress")          # someone else
+        table = fn.events_table()
+        for key, minute in [("2026-01-01T10:10:00.000Z#a", 10), ("2026-01-03T09:10:00.000Z#b", 10),
+                            ("2026-01-03T09:20:00.000Z#c", 20), ("2026-01-04T08:10:00.000Z#d", 10),
+                            ("2026-01-03T09:30:00.000Z#f", 30)]:
+            subscriber = "999" if key.endswith("#f") else SUB
+            table.update_item(Key={"subscriber_id": subscriber, "event_at": key},
+                              UpdateExpression="SET #m = :m", ExpressionAttributeNames={"#m": "minute"},
+                              ExpressionAttributeValues={":m": minute})
+        self.assertEqual(fn.progress_minutes_since(SUB, "2026-01-03T09:00:00.000Z#run"), {10, 20})
+
+    def test_progress_minutes_paged(self):
+        self.put(SUB, "2026-01-01T09:00:00.000Z#run", "registered", True)
+        for i in range(300):
+            fn.events_table().put_item(Item={"subscriber_id": SUB, "event_at": f"2026-01-01T10:{i // 60:02d}:{i % 60:02d}.000Z#{i:03d}",
+                                             "event": "progress", "minute": 10 * (1 + i % 7)})
+        self.assertEqual(fn.progress_minutes_since(SUB, "2026-01-01T09:00:00.000Z#run"), {10, 20, 30, 40, 50, 60, 70})
+
+    def test_record_qualified(self):
+        self.put(SUB, "2026-01-01T13:15:00.000Z#p", "reached_pitch")
+        fn.record_qualified(SUB, "2026-01-01T13:15:00.000Z#p", False, [10, 20])
+        row = fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": "2026-01-01T13:15:00.000Z#p"})["Item"]
+        self.assertIs(row["qualified"], False)
+        self.assertEqual([int(m) for m in row["missing_marks"]], [10, 20])
+
+    def test_record_qualified_needs_the_row(self):
+        with self.assertRaises(ClientError):
+            fn.record_qualified(SUB, "2026-01-01T13:15:00.000Z#nope", True, [])
+
     def test_cannot_mark_missing_registration(self):
         self.assertFalse(fn.mark_pitch_counted(SUB, REGISTRATION))
         self.assertNotIn("Item", fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": REGISTRATION}))
@@ -420,6 +540,9 @@ class SettingsTests(unittest.TestCase):
             self.OWN + "started-tag-id": " " + STARTED_TAG,
             self.OWN + "watched-tag-id": WATCHED_TAG,
             self.OWN + "watch-count-field": COUNT_FIELD,
+            self.OWN + "clicked-tag-id": CLICKED_TAG,
+            self.OWN + "pitch-second": str(PITCH_SECOND) + "\n",
+            self.OWN + "allowed-missing-marks": str(ALLOWED_MISSING),
         }
 
     def load(self, overrides=None):
@@ -447,7 +570,13 @@ class SettingsTests(unittest.TestCase):
         for name, bad in [(self.OWN + "started-tag-id", "started_watching"),
                           (self.OWN + "watched-tag-id", WATCHED_TAG + "x"),
                           (self.OWN + "allowed-origin", host),
-                          (self.OWN + "allowed-origin", "http://" + host)]:
+                          (self.OWN + "allowed-origin", "http://" + host),
+                          (self.OWN + "clicked-tag-id", "clicked_buy"),
+                          (self.OWN + "pitch-second", "72:09"),
+                          (self.OWN + "pitch-second", "0"),
+                          (self.OWN + "pitch-second", "999999"),
+                          (self.OWN + "allowed-missing-marks", "-1"),
+                          (self.OWN + "allowed-missing-marks", "one")]:
             with self.assertRaises(RuntimeError, msg=f"{name} = {bad}"):
                 self.load({name: bad})
 
