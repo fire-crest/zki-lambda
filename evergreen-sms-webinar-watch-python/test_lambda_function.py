@@ -720,5 +720,30 @@ class NoBusinessDetailsTests(unittest.TestCase):
         self.assertEqual(re.findall(r"\b\d{6,}\b", inspect.getsource(fn)), [])
 
 
+class PageBlockTests(unittest.TestCase):
+    """The page-views/*.js blocks are pasted into Kajabi's Custom Javascript, which wraps them in script tags."""
+
+    FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page-views")
+
+    def blocks(self):
+        names = sorted(n for n in os.listdir(self.FOLDER) if n.endswith(".js"))
+        self.assertEqual(names, ["registration-page.js", "sales-page.js"])
+        for name in names:
+            with open(os.path.join(self.FOLDER, name), encoding="utf-8") as f:
+                yield name, f.read()
+
+    def test_no_script_tags(self):
+        # Even in a comment, a closing script tag ends Kajabi's wrapper early and the block never runs
+        for name, text in self.blocks():
+            self.assertNotRegex(text.lower(), r"<\s*/?\s*script", name)
+
+    def test_placeholders_only(self):
+        # Real addresses and Kit field keys are filled in on the page, never committed
+        for name, text in self.blocks():
+            hosts = re.findall(r"https?://([A-Za-z0-9.-]+)", text)
+            self.assertEqual([h for h in hosts if not h.startswith("YOUR-")], [], name)
+        self.assertEqual(re.findall(r'utm_\w+: "(?!KIT_FIELD_KEY_FOR_)', dict(self.blocks())["registration-page.js"]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

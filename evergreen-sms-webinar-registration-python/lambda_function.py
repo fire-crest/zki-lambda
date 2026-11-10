@@ -14,13 +14,17 @@ For each registration it:
         starts a new "run": the row is marked new_run = true and the
         registration count goes up by 1. If a window is open, the row is
         marked new_run = false and nothing is counted.
-     c. adds the "token ready" tag, which releases the confirmation email -
+     c. copies the registration's UTMs (source, medium, campaign, content)
+        from the subscriber's Kit custom fields onto the 'registered' row.
+        The registration page fills those fields through hidden form fields,
+        so they are this registration's last touch
+     d. adds the "token ready" tag, which releases the confirmation email -
         last, so the token is always saved first, and so the window check in
         (b) sees the tags as they were before this registration (the
         registration automation that resets windows starts on this tag)
 
-new_run is recorded on the row only once, so a retried job can't change the
-decision later after the windows have moved on.
+new_run and the UTMs are recorded on the row only once, so a retried job
+can't change them later, after the windows or the fields have moved on.
 
 Counting once per run: before increasing the count, the job marks that
 registration's row as counted. DynamoDB only accepts the first mark, so a
@@ -34,7 +38,7 @@ How it works - the function runs in two modes, like kit-set-indiv-token:
    registration, hands the Kit work to a background run, and replies 200.
 
 2. JOB MODE (the background run)
-   Does steps a-c. If Kit is busy (429) or broken (5xx), or the network fails,
+   Does steps a-d. If Kit is busy (429) or broken (5xx), or the network fails,
    the job raises an error and Lambda retries it automatically. If every retry
    fails, Lambda sends the failed job to the "on failure" SNS destination,
    which emails admin. Problems a retry can't fix are emailed via SNS directly.
@@ -57,6 +61,8 @@ Store, and the function refuses to run if any of these is missing:
     token-ready-tag-id            String: Kit tag ID added once the token exists
     watch-window-tag-id           String: Kit tag ID meaning "watch window open"
     cart-window-tag-id            String: Kit tag ID meaning "cart window open"
+    utm-fields                    String: the four Kit custom field keys holding the UTM
+                                  source, medium, campaign and content, comma-separated, in that order
 
 Lambda environment variables (all optional except FAILURE_TOPIC_ARN):
   FAILURE_TOPIC_ARN     SNS topic for failure emails
@@ -94,6 +100,8 @@ KIT_TIMEOUT_SECONDS = 10
 JOB_NAME = "registration"
 FAIL_EMAIL_SUBJECT = "Evergreen registration: failure"
 MAX_SUBSCRIBERS_PER_DELIVERY = 100
+UTM_ATTRIBUTES = ("utm_source", "utm_medium", "utm_campaign", "utm_content")  # row attributes, in utm-fields order
+MAX_UTM_LENGTH = 100
 
 _clients = {}
 _settings = None
@@ -257,7 +265,10 @@ def process_registration(subscriber_id, event_at):
             return  # reported; don't release the confirmation email without a token
         logger.info("Saved %s for subscriber %s", cfg["token_field"], subscriber_id)
 
-    # b. New run? Decide once, from the window tags as they were before this registration
+    # b. UTMs of this registration, from the fields the registration page filled in
+    record_utms(subscriber_id, event_at, utm_values(fields, cfg["utm_fields"]))
+
+    # c. New run? Decide once, from the window tags as they were before this registration
     window_open = has_open_window(subscriber_id, cfg)
     new_run = record_new_run(subscriber_id, event_at, not window_open)
     if new_run:
@@ -265,7 +276,7 @@ def process_registration(subscriber_id, event_at):
     else:
         logger.info("Subscriber %s re-registered with a window open: not counted", subscriber_id)
 
-    # c. Token ready - last, because it releases the confirmation email
+    # d. Token ready - last, because it releases the confirmation email
     status, body = kit_request("POST", f"tags/{cfg['token_ready_tag_id']}/subscribers/{subscriber_id}", {}, key)
     if check_kit_status(status, body, f"adding the token-ready tag to subscriber {subscriber_id}"):
         logger.info("Added token-ready tag to subscriber %s", subscriber_id)
@@ -294,6 +305,34 @@ def has_open_window(subscriber_id, cfg):
         if not pagination.get("has_next_page"):
             return False
         cursor = pagination.get("end_cursor")
+
+
+def utm_values(fields, field_keys):
+    """{row attribute: value} for the UTM fields that hold short, printable text."""
+    values = {}
+    for attribute, key in zip(UTM_ATTRIBUTES, field_keys):
+        value = fields.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value and len(value) <= MAX_UTM_LENGTH and value.isprintable():
+                values[attribute] = value
+    return values
+
+
+def record_utms(subscriber_id, event_at, utms):
+    """Store the UTMs on the registration row the first time; a retry can't change them."""
+    if not utms:
+        logger.info("No UTMs in Kit for subscriber %s", subscriber_id)
+        return
+    names = {f"#a{i}": attribute for i, attribute in enumerate(utms)}
+    values = {f":v{i}": value for i, value in enumerate(utms.values())}
+    events_table().update_item(
+        Key={"subscriber_id": subscriber_id, "event_at": event_at},
+        UpdateExpression="SET " + ", ".join(f"#a{i} = if_not_exists(#a{i}, :v{i})" for i in range(len(utms))),
+        ConditionExpression="attribute_exists(event_at)",
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
 
 
 def record_new_run(subscriber_id, event_at, new_run):
@@ -435,6 +474,7 @@ def settings():
             "token_ready_tag_id": own + "token-ready-tag-id",
             "watch_window_tag_id": own + "watch-window-tag-id",
             "cart_window_tag_id": own + "cart-window-tag-id",
+            "utm_fields": own + "utm-fields",
         }
         response = ssm_client().get_parameters(Names=list(names.values()), WithDecryption=True)
         found = {p["Name"]: p["Value"] for p in response["Parameters"]}
@@ -445,6 +485,11 @@ def settings():
         for key in ("token_ready_tag_id", "watch_window_tag_id", "cart_window_tag_id"):
             if not loaded[key].isdigit():
                 raise RuntimeError(f"{names[key]} must be a Kit tag ID (digits only), got {loaded[key]!r}")
+        utm_fields = [key.strip() for key in loaded["utm_fields"].split(",")]
+        if len(utm_fields) != len(UTM_ATTRIBUTES) or not all(utm_fields) or len(set(utm_fields)) != len(utm_fields):
+            raise RuntimeError(f"{names['utm_fields']} must list {len(UTM_ATTRIBUTES)} different Kit field keys, "
+                               f"comma-separated (source, medium, campaign, content), got {loaded['utm_fields']!r}")
+        loaded["utm_fields"] = utm_fields
         _settings = loaded
     return _settings
 

@@ -36,12 +36,13 @@ TEST_SETTINGS = {
     "watch_window_tag_id": os.environ.get("TEST_WATCH_WINDOW_TAG_ID", "1000004"),
     "cart_window_tag_id": os.environ.get("TEST_CART_WINDOW_TAG_ID", "1000005"),
 }
+UTM_FIELDS = ["test_utm_source", "test_utm_medium", "test_utm_campaign", "test_utm_content"]
 SUB = os.environ.get("TEST_SUBSCRIBER_ID", "1234567890")
 SUB2 = "1234567891"
 
 KEY = base64.urlsafe_b64encode(bytes(range(64))).decode()
 OTHER_KEY = base64.urlsafe_b64encode(bytes(range(1, 65))).decode()
-SECRETS = {"kit_api_key": "kit-key", "token_secret": KEY, **TEST_SETTINGS}
+SECRETS = {"kit_api_key": "kit-key", "token_secret": KEY, **TEST_SETTINGS, "utm_fields": UTM_FIELDS}
 HOOK = TEST_SETTINGS["webhook_key"]
 TOKEN_FIELD = TEST_SETTINGS["token_field"]
 COUNT_FIELD = TEST_SETTINGS["registration_count_field"]
@@ -163,9 +164,9 @@ class WebhookTests(unittest.TestCase):
 class FakeKit:
     """Pretends to be Kit for one subscriber: records calls, keeps fields."""
 
-    def __init__(self, token=None, count=None, fail=None, tags=()):
+    def __init__(self, token=None, count=None, fail=None, tags=(), utms=None):
         self.calls = []
-        self.fields = {TOKEN_FIELD: token, COUNT_FIELD: count}
+        self.fields = {TOKEN_FIELD: token, COUNT_FIELD: count, **(utms or {})}
         self.tags = [int(t) for t in tags]
         self.fail = dict(fail or {})  # {(method, first path part): [(status, body), ...]} used in order
 
@@ -193,19 +194,27 @@ class JobTests(unittest.TestCase):
     def setUp(self):
         self.marks = set()
         self.new_runs = {}
+        self.utms = {}
         patchers = [
             mock.patch.object(fn, "settings", return_value=SECRETS),
             mock.patch.object(fn, "notify_failure"),
             mock.patch.object(fn, "mark_counted", side_effect=self.fake_mark),
             mock.patch.object(fn, "unmark_counted", side_effect=lambda s, e: self.marks.discard((s, e))),
             mock.patch.object(fn, "record_new_run", side_effect=self.fake_record_new_run),
+            mock.patch.object(fn, "record_utms", side_effect=self.fake_record_utms),
         ]
-        self.settings, self.notify, self.mark, self.unmark, self.record = [p.start() for p in patchers]
+        self.settings, self.notify, self.mark, self.unmark, self.record, self.record_utms = \
+            [p.start() for p in patchers]
         for p in patchers:
             self.addCleanup(p.stop)
 
     def fake_record_new_run(self, subscriber_id, event_at, new_run):
         return self.new_runs.setdefault((subscriber_id, event_at), new_run)  # first decision wins
+
+    def fake_record_utms(self, subscriber_id, event_at, utms):
+        stored = self.utms.setdefault((subscriber_id, event_at), {})
+        for name, value in utms.items():
+            stored.setdefault(name, value)  # first value wins
 
     def fake_mark(self, subscriber_id, event_at):
         if (subscriber_id, event_at) in self.marks:
@@ -225,6 +234,44 @@ class JobTests(unittest.TestCase):
         self.assertEqual(kit.calls[-1][:2], ("POST", f"tags/{READY_TAG}/subscribers/{SUB}"))
         self.assertEqual(kit.methods(), ["GET", "PUT", "GET", "PUT", "POST"])
         self.notify.assert_not_called()
+
+    def test_utms_copied_from_kit_fields_to_the_row(self):
+        values = ["meta", "paid", "evergreen_test", "ad_7"]
+        self.run_job(FakeKit(utms=dict(zip(UTM_FIELDS, values))))
+        self.assertEqual(self.utms[(SUB, EVENT_AT)], dict(zip(fn.UTM_ATTRIBUTES, values)))
+        self.notify.assert_not_called()
+
+    def test_utms_recorded_before_token_ready(self):
+        order = []
+        self.record_utms.side_effect = lambda *a: order.append("utms")
+        kit = FakeKit(utms={UTM_FIELDS[0]: "direct"})
+        def kit_and_log(method, endpoint, body, key):
+            if method == "POST":
+                order.append("token ready")
+            return kit(method, endpoint, body, key)
+        self.run_job(kit_and_log)
+        self.assertEqual(order, ["utms", "token ready"])
+
+    def test_missing_blank_or_bad_utms_left_out(self):
+        utms = {UTM_FIELDS[0]: "  direct ", UTM_FIELDS[1]: "  ", UTM_FIELDS[2]: "x" * 101, UTM_FIELDS[3]: "a\nb"}
+        self.run_job(FakeKit(utms=utms))
+        self.assertEqual(self.utms[(SUB, EVENT_AT)], {"utm_source": "direct"})
+
+    def test_no_utms_still_registers(self):
+        kit = FakeKit()
+        self.run_job(kit)
+        self.assertEqual(self.utms.get((SUB, EVENT_AT), {}), {})
+        self.assertEqual(kit.calls[-1][:2], ("POST", f"tags/{READY_TAG}/subscribers/{SUB}"))
+
+    def test_retry_keeps_the_first_utms(self):
+        self.run_job(FakeKit(utms={UTM_FIELDS[0]: "meta"}))
+        self.run_job(FakeKit(utms={UTM_FIELDS[0]: "youtube"}))  # fields changed before the retry
+        self.assertEqual(self.utms[(SUB, EVENT_AT)], {"utm_source": "meta"})
+
+    def test_utm_values_maps_fields_in_order(self):
+        fields = {UTM_FIELDS[3]: "c", UTM_FIELDS[0]: "s", "other": "x"}
+        self.assertEqual(fn.utm_values(fields, UTM_FIELDS), {"utm_source": "s", "utm_content": "c"})
+        self.assertEqual(fn.utm_values({UTM_FIELDS[0]: 5, UTM_FIELDS[1]: None}, UTM_FIELDS), {})
 
     def test_existing_valid_token_never_rewritten(self):
         token = kit_token.make_token(SUB, KEY)
@@ -426,6 +473,25 @@ class MarkerTests(unittest.TestCase):
         with self.assertRaises(ClientError):
             fn.record_new_run(SUB, EVENT_AT, True)
 
+    def test_utms_stored_and_first_values_win(self):
+        event_at = fn.log_registration(SUB)
+        fn.record_utms(SUB, event_at, {"utm_source": "meta", "utm_content": "ad_7"})
+        fn.record_utms(SUB, event_at, {"utm_source": "youtube", "utm_medium": "organic"})  # a retry
+        row = fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": event_at})["Item"]
+        self.assertEqual({k: v for k, v in row.items() if k.startswith("utm_")},
+                         {"utm_source": "meta", "utm_content": "ad_7", "utm_medium": "organic"})
+
+    def test_no_utms_leaves_the_row_alone(self):
+        event_at = fn.log_registration(SUB)
+        fn.record_utms(SUB, event_at, {})
+        row = fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": event_at})["Item"]
+        self.assertFalse(any(k.startswith("utm_") for k in row))
+
+    def test_utms_need_an_existing_row(self):
+        with self.assertRaises(ClientError):
+            fn.record_utms(SUB, EVENT_AT, {"utm_source": "meta"})
+        self.assertNotIn("Item", fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": EVENT_AT}))
+
     def test_logged_row_contents(self):
         event_at = fn.log_registration(SUB)
         row = fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": event_at})["Item"]
@@ -451,6 +517,7 @@ class SettingsTests(unittest.TestCase):
             self.OWN + "token-ready-tag-id": READY_TAG,
             self.OWN + "watch-window-tag-id": WATCH_WINDOW_TAG,
             self.OWN + "cart-window-tag-id": CART_WINDOW_TAG,
+            self.OWN + "utm-fields": " , ".join(UTM_FIELDS) + "\n",
         }
 
     def load(self, overrides=None):
@@ -480,6 +547,12 @@ class SettingsTests(unittest.TestCase):
                 self.load({self.OWN + name: "a_tag_name"})
 
 
+    def test_utm_fields_must_be_four_different_keys(self):
+        for bad in ["a,b,c", "a,b,c,d,e", "a,b,,d", "a,b,c,a", "a b c d"]:
+            with self.assertRaises(RuntimeError, msg=bad):
+                self.load({self.OWN + "utm-fields": bad})
+
+
 class NoBusinessDetailsTests(unittest.TestCase):
     """The function's code must work for any business: its settings come from Parameter Store."""
 
@@ -496,7 +569,7 @@ class NoBusinessDetailsTests(unittest.TestCase):
         quoted = set(re.findall(r'"([a-z0-9_]+)"', inspect.getsource(fn)))
         allowed_settings_keys = {"kit_api_key", "token_secret", "webhook_key", "token_field",
                                  "registration_count_field", "token_ready_tag_id",
-                                 "watch_window_tag_id", "cart_window_tag_id"}
+                                 "watch_window_tag_id", "cart_window_tag_id", "utm_fields"}
         suspicious = {q for q in quoted - allowed_settings_keys
                       if q.endswith(("_token", "_count", "_ready")) or q.startswith("indiv")}
         self.assertEqual(suspicious, set())

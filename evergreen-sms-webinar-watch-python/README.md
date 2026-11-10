@@ -171,9 +171,9 @@ matched to a person or a run; watch their number for broken links.
 | `test_lambda_function.py` | Tests (`python3 -m unittest -v`). No AWS or Kit needed. The event log tests also need `pip install "moto[dynamodb]"`, and are skipped without it |
 | `watch-page/watch-page.html` | The watch page block: video, tracking and buy button. Paste into a Kajabi Custom Code block |
 | `watch-page/README.md` | How the page works, its settings, and how to test it in a browser |
-| `page-views/registration-page.html` | Registration page view counter. Paste into a Kajabi Custom Code block on that page |
-| `page-views/sales-page.html` | Sales page visit counter. Paste into a Kajabi Custom Code block on that page |
-| `page-views/README.md` | How to add the counters and test them |
+| `page-views/registration-page.js` | Registration page block: page view counter, UTMs into the Kit form, email hand-off. Paste into the page's Custom Javascript |
+| `page-views/sales-page.js` | Sales page visit counter. Paste into the page's Custom Javascript |
+| `page-views/README.md` | How to add the blocks and test them |
 
 It needs the same `cryptography-py313-arm64` layer as `kit-set-indiv-token`.
 

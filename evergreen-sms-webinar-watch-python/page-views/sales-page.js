@@ -1,7 +1,10 @@
-<!--
+/*
   Evergreen SMS webinar: sales page visit counter
 
-  Paste this whole file into ONE Kajabi "Custom Code" block on the sales page.
+  Paste this whole file into the sales page's settings → Custom Code →
+  Custom Javascript. It has no script tags, because Kajabi adds them there.
+  (To use a Custom Code block in the page content instead, add an opening and
+  closing script tag around it.)
   It shows nothing on the page, and doesn't affect the Countdown Hero timer.
   Each time the page loads, it logs a sales_page_visit row to the event log:
   under the subscriber if the address carries ?indiv_token=XXXX (the watch page
@@ -9,9 +12,7 @@
   and as an anonymous visit if it doesn't, so broken links still get counted.
 
   Only edit the SETTINGS section below.
--->
-
-<script>
+*/
 (function () {
   /* ======================= SETTINGS: edit this only ======================= */
 
@@ -36,4 +37,3 @@
     keepalive: true // finish sending even if the visitor leaves straight away
   }).catch(function () { /* a missed visit isn't worth bothering the visitor about */ });
 })();
-</script>

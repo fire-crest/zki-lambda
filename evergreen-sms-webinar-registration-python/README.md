@@ -16,8 +16,8 @@ flowchart TD
     Fn -->|"2. write 'registered' row"| DB
     Fn -->|"3. reply 200"| Hook
     Fn -->|"4. start background run"| Job
-    Job -->|"5a. token, if missing<br/>5b. window open? count +1 if not<br/>5c. token-ready tag"| Kit["Kit API v4"]
-    Job -->|"record new_run,<br/>mark counted"| DB
+    Job -->|"5a. token, if missing<br/>5c. window open? count +1 if not<br/>5d. token-ready tag"| Kit["Kit API v4"]
+    Job -->|"5b. record UTMs<br/>record new_run, mark counted"| DB
     Job -. "Kit busy: automatic retries<br/>still failing: email" .-> SNS
 ```
 
@@ -28,7 +28,14 @@ flowchart TD
 2. **In the background, in this order:**
    1. **Token:** if the subscriber's token is missing or invalid, a correct one
       is created and saved. A valid existing token is never changed.
-   2. **New run?** The job reads the subscriber's tags in Kit. If they have the
+   2. **UTMs:** the registration page puts this visit's UTMs into four Kit
+      custom fields through hidden form fields (`direct` for any not in the
+      address). The job copies those four values onto the `registered` row as
+      `utm_source`, `utm_medium`, `utm_campaign` and `utm_content`. They're
+      recorded only once, so a retry can't pick up a later registration's
+      values. Values that aren't printable text of up to 100 characters are
+      left out. A subscriber with none of the fields set is still registered.
+   3. **New run?** The job reads the subscriber's tags in Kit. If they have the
       watch-window or cart-window tag, a watch-and-purchase window is already
       open: the row is marked `new_run = false` and nothing is counted. If
       not, this registration **starts a new run**: the row is marked
@@ -39,9 +46,9 @@ flowchart TD
       - Counting uses a `counted_at` mark on the row. DynamoDB accepts only the
         first mark, so a retry can't count twice. If Kit then fails in a way
         worth retrying, the mark is removed so the retry can count it.
-   3. **Token-ready tag:** added last, every time, because it releases the
+   4. **Token-ready tag:** added last, every time, because it releases the
       confirmation email (the registration automation decides what to send).
-      Being last also means step 2 sees the window tags as they were *before*
+      Being last also means step 3 sees the window tags as they were *before*
       this registration, since the automation that resets windows starts on
       this tag. If the token couldn't be saved, the tag isn't added and admin
       is emailed.
@@ -51,9 +58,11 @@ they've started". Re-registering while a window is open is logged but not
 counted. `evergreen-sms-webinar-watch` counts at most one watch per run, so the
 watch count can never exceed the registration count.
 
-Not yet included: UTMs on the `registered` row (a later step, once the page
-script that passes them to the form exists), and the Kajabi contact (waits on
-Spike 2's Kajabi API question).
+The registration page block that fills the UTM fields is
+`evergreen-sms-webinar-watch-python/page-views/registration-page.js` (it also
+counts page views, so it lives with the page view counter).
+
+Not yet included: the Kajabi contact (Spike 2 is testing it).
 
 ## Event log rows
 
@@ -67,6 +76,7 @@ The same `evergreen_events` table as `evergreen-sms-webinar-watch`:
 | `source` | `kit_form` | |
 | `new_run` | `true` | `true` if this registration started a new run (no window open), `false` if a window was already open |
 | `counted_at` | `2026-11-06T19:40:13.002+00:00` | added once the registration count has been increased (new runs only) |
+| `utm_source`, `utm_medium`, `utm_campaign`, `utm_content` | `meta`, `paid`, `evergreen_jan27`, `ad_7` | this registration's UTMs (last touch), from the Kit fields; `direct` when the address had none |
 | `pitch_counted_at` | `2026-11-06T21:02:44.120+00:00` | added by `evergreen-sms-webinar-watch` once this run's watch has been counted |
 
 No email addresses are stored.
@@ -100,6 +110,7 @@ Create these in **Systems Manager → Parameter Store**, all **Tier: Standard**:
 | `/zki/evergreen-registration/token-ready-tag-id` | String | ID of the Kit tag that releases the confirmation email |
 | `/zki/evergreen-registration/watch-window-tag-id` | String | ID of the Kit tag meaning "watch window open" |
 | `/zki/evergreen-registration/cart-window-tag-id` | String | ID of the Kit tag meaning "cart window open" |
+| `/zki/evergreen-registration/utm-fields` | String | Keys of the four Kit custom fields holding the UTM source, medium, campaign and content, **in that order**, separated by commas (e.g. `key_a,key_b,key_c,key_d`) |
 
 Make the webhook key with:
 
@@ -109,8 +120,9 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 This is a separate key from the token function's, so either can be changed
 without touching the other. The function also uses the existing
-`/zki/kit-api-key` and `/zki/token-secret`. If any parameter is missing, or the
-tag ID isn't a number, the function refuses to run and emails you the reason.
+`/zki/kit-api-key` and `/zki/token-secret`. If any parameter is missing, a
+tag ID isn't a number, or `utm-fields` doesn't list four different keys, the
+function refuses to run and emails you the reason.
 
 ### 2. Create the function
 
@@ -277,6 +289,15 @@ the window tags at the time: until the registration automation is built,
 nothing adds the window tags, so all three are new runs and the count is **3**.
 Once the automation adds the watch-window tag on registration, the second and
 third submissions will be within an open window: logged, but not counted.
+
+### E. Test the UTMs
+
+This needs the registration page block (`registration-page.js`) on the page
+with the form; its README has the full test. In short: open the registration
+page with `?utm_source=test&utm_campaign=reg_test`, register, and check the new
+`registered` row has `utm_source` `test`, `utm_campaign` `reg_test`, and
+`direct` for medium and content. Register again from the page **without** the
+`?…`: the next row has `direct` for all four.
 
 The existing new-subscriber webhook to `kit-set-indiv-token` will also run for
 brand-new subscribers. That's harmless: both functions make the identical token.
