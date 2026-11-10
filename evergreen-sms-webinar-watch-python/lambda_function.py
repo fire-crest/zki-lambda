@@ -20,8 +20,9 @@ so it can never apply sms-member or anything else.
   progress       log it (with the minute) - never calls Kit
   reached_pitch  log it, then decide whether they watched properly (below). If so,
                  tag <watched-tag-id> and add 1 to <watch-count-field>, once per run
-  cta_click      log it, then tag <clicked-tag-id> (the buy button was clicked;
-                 this starts the cart for people who skipped to the pitch)
+  cta_click      log it, then tag <clicked-tag-id>. The watch page no longer sends
+                 this (the buy button goes to GET /buy, below); it's still accepted
+                 so an old copy of the page keeps working
 
 Watched properly ("qualified"): the watch page only sends a progress mark when
 the video actually plays across it, not when someone drags past it. When
@@ -52,6 +53,27 @@ Both pages may also send utm_source, utm_medium, utm_campaign and utm_content
 text; anything else is left out. Every page load is counted: there's no visitor
 ID or cookie, so the registration page conversion read from the log is a low
 estimate (the GA4 figure is the high one).
+
+The watch page's buy button is a plain link to the same Function URL:
+
+    GET /buy?indiv_token=<indiv_token>
+
+Countdown Hero keys its cart timer on the email, but the watch page only knows
+the token, so this swaps one for the other:
+
+  1. reads the subscriber from the token
+  2. logs cta_click and tags <clicked-tag-id> in the background (as above)
+  3. asks Kit for the subscriber's email (trying twice, briefly)
+  4. redirects the browser to <buy-link>, with {email} replaced by the email and
+     indiv_token added. Countdown Hero starts the cart timer (or keeps one that's
+     already running) and opens the sales page
+
+If the token is missing or doesn't check out, or Kit can't give the email, the
+browser goes to <buy-fallback-url> instead (a page asking them to go back and
+click again), the click is still logged, and admin is emailed if Kit failed.
+A missing or invalid token is logged under subscriber_id "buy_button" with
+token_status "missing" or "invalid". The email is never logged or stored: it
+only appears in the redirect.
 
 A "run" is one watch-and-purchase window. It starts with a registration made
 while no window was open; evergreen-sms-webinar-registration marks that
@@ -101,6 +123,10 @@ and the function refuses to run if any of these is missing:
                                 video. MUST match T_PITCH in the watch page script
     allowed-missing-marks       how many of the 10-minute marks before the pitch may be
                                 missing and still count as watching properly, e.g. 1
+    buy-link                    the Countdown Hero trigger link for the cart, with {email}
+                                where the email goes, e.g. https://example.com/t/abc/{email}
+    buy-fallback-url            where the buy button goes if the email can't be found,
+                                e.g. https://www.example.com/try-again
 
 Lambda environment variables (all optional except FAILURE_TOPIC_ARN):
   FAILURE_TOPIC_ARN     SNS topic for failure emails
@@ -119,6 +145,7 @@ import secrets
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import quote, urlencode
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
@@ -137,6 +164,10 @@ PROGRESS_STEP = 10
 
 KIT_API_BASE = "https://api.kit.com/v4/"
 KIT_TIMEOUT_SECONDS = 10
+BUY_KIT_TIMEOUT_SECONDS = 4   # someone is waiting on a click: keep each try short
+BUY_KIT_ATTEMPTS = 2
+MAX_EMAIL_LENGTH = 254
+SSM_BATCH = 10   # AWS limit on names per GetParameters call
 JOB_NAME = "kit_actions"
 FAIL_EMAIL_SUBJECT = "Evergreen watch: failure"
 MAX_BODY_BYTES = 2000
@@ -181,9 +212,13 @@ def lambda_handler(event, context):
 
 def handle_page_call(event, context):
     http = event["requestContext"].get("http", {})
+    path = event.get("rawPath", "").rstrip("/")
+    if path == "/buy":
+        if http.get("method") != "GET":
+            return respond(405, "GET only")
+        return handle_buy(event, context)
     if http.get("method") != "POST":
         return respond(405, "POST only")
-    path = event.get("rawPath", "").rstrip("/")
     if path not in ("/milestone", "/page-view"):
         return respond(404, "Not found")
 
@@ -234,22 +269,116 @@ def record_milestone(request, cfg, context):
 
     actions = milestone_actions(milestone, cfg)
     if actions["tags"] or actions["increment"]:
-        try:
-            lambda_client().invoke(
-                FunctionName=context.invoked_function_arn,
-                InvocationType="Event",
-                Payload=json.dumps({"job": JOB_NAME, "subscriber_id": subscriber_id,
-                                    "milestone": milestone, "event_at": event_at}).encode("utf-8"),
-            )
-        except Exception as error:
-            # The event is already logged; only the Kit update is missing
-            notify_failure(f"Logged {milestone} for subscriber {subscriber_id} but could not start "
-                           f"the Kit update: {error}")
+        # The event is already logged; if this fails only the Kit update is missing
+        if not start_kit_job(subscriber_id, milestone, event_at, context):
             return respond(503, "Service temporarily unavailable")
 
     logger.info("Recorded %s%s for subscriber %s", milestone,
                 f" minute {minute}" if minute else "", subscriber_id)
     return respond(200, "OK")
+
+
+def handle_buy(event, context):
+    """The buy button: swap the token for the email and send the browser on to Countdown Hero.
+
+    A link click, not a script call, so there's no Origin check: anyone holding
+    a token can only ever be sent to that subscriber's own cart.
+    """
+    try:
+        cfg = settings()
+    except Exception as error:
+        notify_failure(f"Could not load settings from Parameter Store: {error}")
+        return respond(503, "Service temporarily unavailable")
+
+    token = (event.get("queryStringParameters") or {}).get("indiv_token") or ""
+    subscriber_id = read_token(token, cfg["token_secret"]) if token else None
+    if subscriber_id is None:
+        status = "invalid" if token else "missing"
+        logger.warning("Buy click with a %s token", status)
+        try:
+            log_event("buy_button", "cta_click", source="buy_button", details={"token_status": status})
+        except Exception as error:
+            notify_failure(f"Could not write a cta_click event (token {status}) to {EVENTS_TABLE}: {error}")
+        return redirect(cfg["buy_fallback_url"])
+
+    # Log and tag the click. Neither may stop the sale, so failures are only reported.
+    event_at = None
+    try:
+        event_at = log_event(subscriber_id, "cta_click")
+    except Exception as error:
+        notify_failure(f"Could not write cta_click event for subscriber {subscriber_id} "
+                       f"to {EVENTS_TABLE}: {error}")
+    start_kit_job(subscriber_id, "cta_click", event_at, context)
+
+    email = subscriber_email(subscriber_id, cfg["kit_api_key"])
+    if email is None:
+        return redirect(cfg["buy_fallback_url"])
+    logger.info("Sent subscriber %s to the cart", subscriber_id)
+    return redirect(cart_link(cfg["buy_link"], email, token))
+
+
+def start_kit_job(subscriber_id, milestone, event_at, context):
+    """Hand the Kit work to a background run. Returns False (and emails admin) if it couldn't start."""
+    try:
+        lambda_client().invoke(
+            FunctionName=context.invoked_function_arn,
+            InvocationType="Event",
+            Payload=json.dumps({"job": JOB_NAME, "subscriber_id": subscriber_id,
+                                "milestone": milestone, "event_at": event_at}).encode("utf-8"),
+        )
+        return True
+    except Exception as error:
+        notify_failure(f"Logged {milestone} for subscriber {subscriber_id} but could not start "
+                       f"the Kit update: {error}")
+        return False
+
+
+def subscriber_email(subscriber_id, api_key):
+    """The subscriber's email from Kit, or None (admin is emailed). Never logs the email or Kit's reply."""
+    problem = "no reply"
+    for _ in range(BUY_KIT_ATTEMPTS):
+        try:
+            status, body = kit_request("GET", f"subscribers/{subscriber_id}", None, api_key,
+                                       timeout=BUY_KIT_TIMEOUT_SECONDS)
+        except RetryableError:
+            problem = "a network error"
+            continue
+        if status == 429 or status >= 500:
+            problem = f"status {status}"
+            continue
+        if not 200 <= status < 300:
+            problem = f"status {status}"
+            break
+        try:
+            email = json.loads(body)["subscriber"]["email_address"]
+        except (ValueError, KeyError, TypeError):
+            email = None
+        if usable_email(email):
+            return email
+        problem = "a reply with no usable email"
+        break
+    notify_failure(f"Buy button: could not get the email for subscriber {subscriber_id} from Kit "
+                   f"({problem}), so they were sent to the fallback page instead of the cart")
+    return None
+
+
+def usable_email(email):
+    return (isinstance(email, str) and 3 <= len(email) <= MAX_EMAIL_LENGTH and "@" in email
+            and email.isprintable() and not any(c.isspace() for c in email))
+
+
+def cart_link(template, email, token):
+    """The Countdown Hero trigger link for this subscriber, with the token passed on to the sales page."""
+    link = template.replace("{email}", quote(email, safe="@+"))
+    return link + ("&" if "?" in link else "?") + urlencode({"indiv_token": token})
+
+
+def redirect(location):
+    return {
+        "statusCode": 302,
+        "headers": {"Location": location, "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        "body": "",
+    }
 
 
 def record_page_view(request, cfg):
@@ -543,7 +672,7 @@ def check_kit_status(status, body, what):
     return False
 
 
-def kit_request(method, endpoint, body, api_key):
+def kit_request(method, endpoint, body, api_key, timeout=KIT_TIMEOUT_SECONDS):
     """Call the Kit v4 API. Returns (status_code, response_text). Raises RetryableError on network failure."""
     request = urllib.request.Request(
         KIT_API_BASE + endpoint,
@@ -556,7 +685,7 @@ def kit_request(method, endpoint, body, api_key):
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=KIT_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as error:
         return error.code, error.read().decode("utf-8", "replace")
@@ -583,9 +712,15 @@ def settings():
             "watch_count_field": own + "watch-count-field",
             "pitch_second": own + "pitch-second",
             "allowed_missing_marks": own + "allowed-missing-marks",
+            "buy_link": own + "buy-link",
+            "buy_fallback_url": own + "buy-fallback-url",
         }
-        response = ssm_client().get_parameters(Names=list(names.values()), WithDecryption=True)
-        found = {p["Name"]: p["Value"] for p in response["Parameters"]}
+        # GetParameters takes at most SSM_BATCH names per call
+        wanted = list(names.values())
+        found = {}
+        for start in range(0, len(wanted), SSM_BATCH):
+            response = ssm_client().get_parameters(Names=wanted[start:start + SSM_BATCH], WithDecryption=True)
+            found.update({p["Name"]: p["Value"] for p in response["Parameters"]})
         missing = [name for name in names.values() if not found.get(name)]
         if missing:
             raise RuntimeError(f"Missing or empty parameters: {', '.join(missing)}")
@@ -599,8 +734,12 @@ def settings():
         if not loaded["allowed_missing_marks"].isdigit():
             raise RuntimeError(f"{names['allowed_missing_marks']} must be a whole number (0 or more), "
                                f"got {loaded['allowed_missing_marks']!r}")
-        if not loaded["allowed_origin"].startswith("https://"):
-            raise RuntimeError(f"{names['allowed_origin']} must start with https://, got {loaded['allowed_origin']!r}")
+        for key in ("allowed_origin", "buy_link", "buy_fallback_url"):
+            if not loaded[key].startswith("https://"):
+                raise RuntimeError(f"{names[key]} must start with https://, got {loaded[key]!r}")
+        if loaded["buy_link"].count("{email}") != 1 or "#" in loaded["buy_link"]:
+            raise RuntimeError(f"{names['buy_link']} must contain {{email}} exactly once (where the email "
+                               f"goes) and no #, got {loaded['buy_link']!r}")
         _settings = loaded
     return _settings
 

@@ -7,6 +7,10 @@ event log, and the important ones are also recorded in Kit.
 It also counts visits to the registration page and the sales page
 ([Page views](#page-views) below). Those only go to the event log, never to Kit.
 
+The watch page's buy button is a link to this function too
+([The buy button](#the-buy-button) below): it swaps the token for the email and
+sends the browser on to the Countdown Hero cart timer.
+
 New for the evergreen funnel. The page can't choose which tag to apply, so it
 can never apply a purchase tag or anything else. (The WordPress plugin's `/kit/`
 and `/kittag/` replay endpoints are separate and not yet migrated; see the main README.)
@@ -15,6 +19,8 @@ and `/kittag/` replay endpoints are separate and not yet migrated; see the main 
 flowchart TD
     Page["Watch page<br/>(allowed website)"] -->|"1. POST /milestone<br/>token + milestone"| Fn
     Views["Registration and<br/>sales pages"] -->|"POST /page-view<br/>log only"| Fn
+    Page -->|"buy button:<br/>GET /buy?indiv_token="| Fn
+    Fn -->|"302 to the trigger link<br/>with the email"| CH["Countdown Hero<br/>then the sales page"]
     subgraph AWS
         Fn["Lambda: page mode<br/>checks token + website"]
         Job["Lambda: job mode<br/>(background run)"]
@@ -36,7 +42,7 @@ flowchart TD
 | `started` | 30 seconds actually played, so auto-play alone doesn't count | tag `started-tag-id` | ✅ |
 | `progress` | the video **plays across** 10:00, 20:00, 30:00… (not when dragged past): `minute` 10, 20, 30… | nothing | ✅ with the minute |
 | `reached_pitch` | the position reaches the pitch, however they got there | **only if they watched properly** (below): tag `watched-tag-id`, then add 1 to `watch-count-field`, **once per run** | ✅ with `qualified` |
-| `cta_click` | the buy button is clicked | tag `clicked-tag-id` (starts the cart for people who skipped ahead) | ✅ |
+| `cta_click` | no longer sent by the page: the buy button goes to [`GET /buy`](#the-buy-button), which logs `cta_click` itself. Still accepted from an old copy of the page | tag `clicked-tag-id` | ✅ |
 
 The page sends:
 
@@ -44,7 +50,6 @@ The page sends:
 { "token": "<indiv_token>", "milestone": "started" }
 { "token": "<indiv_token>", "milestone": "progress", "minute": 20 }
 { "token": "<indiv_token>", "milestone": "reached_pitch" }
-{ "token": "<indiv_token>", "milestone": "cta_click" }
 ```
 
 The page itself is in [`watch-page/`](watch-page/), with its own README.
@@ -92,6 +97,40 @@ A blank or non-numeric watch count counts as 0. The tag IDs, field name and
 allowed website all come from Parameter Store (step 2 below), so none of them
 appear in the code or this guide.
 
+## The buy button
+
+Countdown Hero keys each cart timer on the subscriber's **email**, but the watch
+page only knows the `indiv_token`. So the buy button is a plain link to
+
+```
+GET https://…lambda-url….on.aws/buy?indiv_token=<indiv_token>
+```
+
+and the function:
+
+1. reads the subscriber from the token;
+2. logs `cta_click` and adds the "clicked buy" tag in the background, exactly as the milestone did;
+3. asks Kit for the subscriber's email (up to two tries of 4 seconds);
+4. redirects the browser (`302`) to `buy-link`, with `{email}` replaced by the
+   email and `indiv_token` added. Countdown Hero starts the timer, or keeps one
+   that's already running (first trigger wins), and opens the sales page with
+   `cdt` and `indiv_token` in the address.
+
+| Problem | Where the browser goes | Logged | Admin emailed |
+|---|---|---|---|
+| none | the cart (`buy-link`) | `cta_click` under the subscriber | no |
+| Kit busy, broken or unreachable twice, or no usable email | `buy-fallback-url` | `cta_click` under the subscriber | yes |
+| token missing or not valid | `buy-fallback-url` | `cta_click` under `buy_button`, `token_status` `missing` or `invalid` | no |
+| the event log or the background tag job fails | the cart (the sale isn't stopped) | — | yes |
+| settings can't be loaded | an error (`503`) | — | yes |
+
+`buy-fallback-url` is a small page asking them to go back and click the button
+again. The email is never logged or stored: it only appears in the redirect,
+and so in the Countdown Hero link and the sales page address. It's a link, not
+a script call, so there's no website check: a token only ever leads to its own
+subscriber's cart. Replies are marked `Cache-Control: no-store` so a browser
+never reuses an old redirect.
+
 ## Watched properly ("qualified")
 
 The watch page only sends a `progress` mark when the video actually plays
@@ -107,7 +146,8 @@ of the subscriber's **current run**, from any visit and any device.
   `missing_marks` listing any that were missing.
 - **Qualified:** "watched" tag, watch count (once per run), and the cart starts.
 - **Not qualified:** no tag and no count. The page still shows the buy button,
-  and clicking it (`cta_click`) starts the cart through the "clicked buy" tag.
+  and clicking it starts the cart (the button is the Countdown Hero trigger link,
+  via [`/buy`](#the-buy-button)).
 - **No run on record:** can't qualify; logged as not qualified, and admin is emailed.
 
 Someone who drags to the pitch, then later goes back and watches the missing
@@ -141,14 +181,14 @@ buying. It can never exceed the registration count, which counts runs started.
 |---|---|---|
 | `subscriber_id` | `1234567890` | partition key |
 | `event_at` | `2026-11-06T14:12:03.123Z#a1b2c3` | sort key: UTC time, plus a random suffix so two events in the same millisecond don't collide |
-| `subscriber_id` (page views) | `registration_page`, `sales_page` | anonymous page views (see [Page views](#page-views)) |
+| `subscriber_id` (page views) | `registration_page`, `sales_page`, `buy_button` | anonymous page views (see [Page views](#page-views)), and buy clicks with a missing or invalid token |
 | `event` | `started`, `progress`, `reached_pitch`, `cta_click`, `registration_page_view`, `sales_page_visit` | |
 | `minute` | `20` | `progress` only |
 | `qualified` | `true` | `reached_pitch` only: whether they watched properly |
 | `missing_marks` | `[70]` | `reached_pitch` only: the required marks they hadn't played through |
-| `source` | `watch_page`, `registration_page`, `sales_page` | |
+| `source` | `watch_page`, `registration_page`, `sales_page`, `buy_button` | |
 | `utm_source`, `utm_medium`, `utm_campaign`, `utm_content` | `meta` | page views only, when the address had them |
-| `token_status` | `valid`, `missing`, `invalid` | `sales_page_visit` only |
+| `token_status` | `valid`, `missing`, `invalid` | `sales_page_visit`, and anonymous `cta_click` rows (`missing` or `invalid`) |
 | `pitch_counted_at` | `2026-11-07T10:20:01+00:00` | on `registered` rows only: set when that registration's watch has been counted |
 
 The index `by_event` (partition `event`, sort `event_at`) answers "all `started` events between two dates". Rows
@@ -192,7 +232,7 @@ You've reserved 10 for `kit-set-indiv-token` and will reserve 10 here, and AWS a
 
 ### 2. Add this function's settings to Parameter Store
 
-Nothing specific to the business is in the code. Create these four parameters
+Nothing specific to the business is in the code. Create these parameters
 in **Systems Manager → Parameter Store**, each with **Tier: Standard** and
 **Type: String** (they aren't secrets):
 
@@ -205,6 +245,8 @@ in **Systems Manager → Parameter Store**, each with **Tier: Standard** and
 | `/zki/evergreen-watch/clicked-tag-id` | ID of the Kit tag for "clicked the buy button" |
 | `/zki/evergreen-watch/pitch-second` | When the pitch starts, in seconds (e.g. 4329 for 72:09). **Must match `T_PITCH` in the watch page**: change both together |
 | `/zki/evergreen-watch/allowed-missing-marks` | How many 10-minute marks before the pitch may be missing, e.g. `1` |
+| `/zki/evergreen-watch/buy-link` | The cart Countdown Hero's **trigger link**, with `{email}` typed where the email goes (Countdown Hero puts it at the end of the path), e.g. `https://…/{email}`. Must start with https, contain `{email}` exactly once, and have no `#` |
+| `/zki/evergreen-watch/buy-fallback-url` | The page the buy button goes to if the email can't be found ("please go back and click again"), e.g. `https://www.example.com/try-again` |
 
 To find a tag's ID in Kit, open the tag: the ID is the number at the end of the
 page address. A custom field's key is shown in Kit's custom field settings.
@@ -287,6 +329,7 @@ The function adds rows, reads one subscriber's history (`Query`) to find their l
 
 - **Asynchronous invocation:** retry attempts **2**, maximum age of event **1 h**.
 - **Destinations:** Asynchronous invocation → On failure → SNS topic → your failure topic.
+- **Timeout** (Configuration → General configuration): at least **15 seconds**, so `/buy` can try Kit twice.
 - **Concurrency:** reserve **10**. Each call takes a fraction of a second, so 10 handles around 100 calls a second.
 
 ### 7. Function URL with CORS
@@ -313,7 +356,9 @@ aws lambda add-permission --function-name evergreen-sms-webinar-watch --statemen
 The watch page's endpoint is the Function URL followed by `milestone`, e.g.
 `https://abc123….lambda-url.REGION.on.aws/milestone`. The registration and sales
 pages use the same Function URL followed by `page-view`. All three pages must be
-on the `allowed-origin` website.
+on the `allowed-origin` website. The buy button uses the Function URL followed
+by `buy`; the watch page works this out from its `MILESTONE_URL`. It's a link,
+so CORS doesn't apply to it and **Allow methods** stays `POST`.
 
 ---
 
@@ -355,6 +400,16 @@ repeat calls 2 and 5; then the watch count goes up by 1.
 **No run.** Repeat call 3 with the token of a subscriber who has never used the
 registration form: `200`, not qualified, no tag, no change to their watch
 count, and a failure email saying they had no run on record.
+
+**The buy button.** In a private window, open
+`…on.aws/buy?indiv_token=TOKEN`:
+
+| # | Address | Expect |
+|---|---|---|
+| 1 | with the test subscriber's token | Countdown Hero's page opens with the timer running; the address has `cdt` and `indiv_token`. A `cta_click` row, and the "clicked buy" tag |
+| 2 | the same again | the same timer, not restarted (first trigger wins) |
+| 3 | `TOKEN-WITH-ONE-LETTER-CHANGED` | the fallback page. A `cta_click` row under `buy_button` with `token_status` `invalid` |
+| 4 | with no `?indiv_token=` at all | the fallback page. `token_status` `missing` |
 
 **Page views.** POST to `…on.aws/page-view`:
 

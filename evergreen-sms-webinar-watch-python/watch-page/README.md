@@ -11,7 +11,7 @@ video, the viewing tracking and the buy button. It talks to the
 | 30 seconds actually **played** (`T_START`) | sends `started` | logs it, adds the "started" tag |
 | The video **plays across** 10:00, 20:00, 30:00… (`LOG_EVERY`) | sends `progress` with the minute | logs it (no Kit call) |
 | The position reaches the pitch (`T_PITCH`), however they got there | reveals the buy button, sends `reached_pitch` | logs it and decides whether they **watched properly** (see the function's README). If so: "watched" tag, watch count (once per run) and the cart starts |
-| The buy button is clicked | opens the sales page straight away, with the token added, and sends `cta_click` | logs it, adds the "clicked buy" tag (starts the cart for people who skipped ahead) |
+| The buy button is clicked | it's a plain link to the function's `/buy` address, with the token | logs `cta_click`, adds the "clicked buy" tag, looks up the email in Kit and sends the browser to the Countdown Hero trigger link, which starts the cart timer and opens the sales page. If the email can't be found: the "please click again" page |
 
 - **Dragging doesn't count as watching.** A jump of more than 3 seconds between
   position updates is treated as dragging: no `progress` mark is sent for marks
@@ -23,8 +23,9 @@ video, the viewing tracking and the buy button. It talks to the
   `progress` marks from every visit in the current run.
 - **If a call fails** (network or a server problem), the page tries once more
   5 seconds later, then gives up quietly. The viewer never sees an error.
-- **No `indiv_token` in the address:** the video and the button still work, but
-  nothing is recorded.
+- **No `indiv_token` in the address:** the video still plays, but nothing is
+  recorded, and the button leads to the "please click again" page (there's no
+  email to start a cart timer with).
 
 ## Settings
 
@@ -37,7 +38,6 @@ All at the top of the script, in the `SETTINGS` section:
 | `T_START` | seconds of real playback before `started` (30) |
 | `T_PITCH` | when the pitch starts, in seconds. **Must match** `/zki/evergreen-watch/pitch-second` in Parameter Store: change both together |
 | `LOG_EVERY` | keep at 600 (every 10 minutes); Lambda only accepts 10, 20, 30… |
-| `SALES_URL` | the sales page address; the token is added automatically |
 
 The button wording is in the HTML near the top of the file.
 
@@ -72,8 +72,9 @@ The button wording is in the HTML near the top of the file.
    appear, and one `reached_pitch` call. In DynamoDB, that `reached_pitch` row
    shows `qualified` = false and lists the missing marks. In Kit: **no** "watched"
    tag, and the watch count is unchanged.
-3. Click the buy button. **Expect** the sales page to open straight away with
-   `?indiv_token=…` in its address, and the "clicked buy" tag in Kit.
+3. Click the buy button. **Expect** a moment's pause, then the sales page with
+   the cart timer running and `cdt` and `indiv_token` in its address, and the
+   "clicked buy" tag in Kit.
 
 **B. Watching properly** (about 10 minutes, using short plays)
 

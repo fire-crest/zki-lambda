@@ -19,7 +19,7 @@ import re
 import unittest
 from types import SimpleNamespace
 from unittest import mock
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from botocore.exceptions import ClientError
 
@@ -38,6 +38,8 @@ TEST_SETTINGS = {
     "clicked_tag_id": os.environ.get("TEST_CLICKED_TAG_ID", "1000003"),
     "pitch_second": os.environ.get("TEST_PITCH_SECOND", "4329"),          # 72:09 -> marks 10..70
     "allowed_missing_marks": os.environ.get("TEST_ALLOWED_MISSING_MARKS", "1"),
+    "buy_link": os.environ.get("TEST_BUY_LINK", "https://timer.example.com/t/abc123/{email}"),
+    "buy_fallback_url": os.environ.get("TEST_BUY_FALLBACK_URL", "https://www.example.com/try-again"),
 }
 SUB = os.environ.get("TEST_SUBSCRIBER_ID", "1234567890")
 
@@ -650,6 +652,148 @@ class EventLogTests(unittest.TestCase):
         self.assertNotIn("Item", fn.events_table().get_item(Key={"subscriber_id": SUB, "event_at": REGISTRATION}))
 
 
+EMAIL = "rider+test@example.com"
+
+
+def buy_call(query, method="GET"):
+    return {
+        "rawPath": "/buy",
+        "rawQueryString": "&".join(f"{k}={v}" for k, v in (query or {}).items()),
+        "queryStringParameters": query,
+        "headers": {},
+        "requestContext": {"http": {"method": method, "sourceIp": "1.2.3.4"}},
+        "isBase64Encoded": False,
+    }
+
+
+def kit_reply(email=EMAIL, status=200):
+    return status, json.dumps({"subscriber": {"id": int(SUB), "email_address": email, "fields": {}}})
+
+
+class BuyTests(PageFakes, unittest.TestCase):
+    """GET /buy: the watch page's buy button."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(fn, "kit_request", return_value=kit_reply())
+        self.kit = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def buy(self, query={"indiv_token": TOKEN}, **kwargs):
+        with self.assertLogs(fn.logger, level="INFO") as logs:
+            fn.logger.info("start")  # assertLogs needs at least one line
+            result = fn.lambda_handler(buy_call(query, **kwargs), CONTEXT)
+        self.log_lines = "\n".join(logs.output)
+        return result
+
+    def assertRedirect(self, result, location):
+        self.assertEqual(result["statusCode"], 302)
+        self.assertEqual(result["headers"]["Location"], location)
+        self.assertEqual(result["headers"]["Cache-Control"], "no-store")
+
+    def expected_cart_link(self, email=EMAIL):
+        return (TEST_SETTINGS["buy_link"].replace("{email}", quote(email, safe="@+"))
+                + "?indiv_token=" + quote(TOKEN, safe=""))
+
+    def test_sends_to_cart_with_email_and_token(self):
+        result = self.buy()
+        self.assertRedirect(result, self.expected_cart_link())
+        location = result["headers"]["Location"]
+        self.assertIn("/" + EMAIL + "?", location)                       # email at the end of the path
+        self.assertEqual(parse_qs(urlsplit(location).query)["indiv_token"], [TOKEN])
+        self.kit.assert_called_once()
+        self.assertEqual(self.kit.call_args.args[:2], ("GET", f"subscribers/{SUB}"))
+        self.assertEqual(self.kit.call_args.kwargs["timeout"], fn.BUY_KIT_TIMEOUT_SECONDS)
+
+    def test_logs_and_tags_the_click(self):
+        self.buy()
+        [row] = self.logged()
+        self.assertEqual((row["subscriber_id"], row["event"], row["source"]), (SUB, "cta_click", "watch_page"))
+        self.assertEqual(self.jobs(), [{"job": "kit_actions", "subscriber_id": SUB, "milestone": "cta_click",
+                                        "event_at": row["event_at"]}])
+        self.notify.assert_not_called()
+
+    def test_email_never_logged_or_stored(self):
+        self.buy()
+        self.assertNotIn(EMAIL, self.log_lines)
+        self.assertNotIn(EMAIL, json.dumps(self.logged()))
+        self.assertNotIn(EMAIL, json.dumps(self.jobs()))
+
+    def test_link_with_existing_query(self):
+        with mock.patch.dict(SECRETS, {"buy_link": "https://timer.example.com/t/{email}?x=1"}):
+            location = self.buy()["headers"]["Location"]
+        self.assertTrue(location.startswith("https://timer.example.com/t/" + EMAIL + "?x=1&indiv_token="))
+
+    def test_odd_characters_in_email_are_encoded(self):
+        self.kit.return_value = kit_reply("o'brien/x?y#z@example.com")
+        location = self.buy()["headers"]["Location"]
+        self.assertIn("/o%27brien%2Fx%3Fy%23z@example.com?indiv_token=", location)
+
+    def test_missing_and_invalid_tokens_go_to_fallback(self):
+        bad = kit_token.make_token(SUB, OTHER_KEY)
+        for query, status in [(None, "missing"), ({}, "missing"), ({"indiv_token": ""}, "missing"),
+                              ({"indiv_token": bad}, "invalid"), ({"indiv_token": "junk"}, "invalid")]:
+            self.table.reset_mock()
+            self.assertRedirect(self.buy(query), TEST_SETTINGS["buy_fallback_url"])
+            [row] = self.logged()
+            self.assertEqual((row["subscriber_id"], row["event"], row["token_status"]),
+                             ("buy_button", "cta_click", status), query)
+        self.kit.assert_not_called()
+        self.assertEqual(self.jobs(), [])
+
+    def test_kit_busy_then_ok(self):
+        self.kit.side_effect = [(503, "busy"), kit_reply()]
+        self.assertRedirect(self.buy(), self.expected_cart_link())
+        self.assertEqual(self.kit.call_count, 2)
+        self.notify.assert_not_called()
+
+    def test_kit_network_error_then_ok(self):
+        self.kit.side_effect = [fn.RetryableError("timeout"), kit_reply()]
+        self.assertRedirect(self.buy(), self.expected_cart_link())
+
+    def test_kit_failing_goes_to_fallback_and_emails_admin(self):
+        for side_effect, calls in [([(429, "slow down"), (500, "err")], 2),
+                                   ([fn.RetryableError("x"), fn.RetryableError("y")], 2),
+                                   ([(404, "not found")], 1),
+                                   ([(200, "not json")], 1),
+                                   ([kit_reply(email="")], 1),
+                                   ([kit_reply(email="no at sign")], 1),
+                                   ([kit_reply(email=None)], 1)]:
+            self.kit.reset_mock(side_effect=True)
+            self.notify.reset_mock()
+            self.kit.side_effect = side_effect
+            self.assertRedirect(self.buy(), TEST_SETTINGS["buy_fallback_url"])
+            self.assertEqual(self.kit.call_count, calls, side_effect)
+            self.notify.assert_called_once()
+            self.assertIn(SUB, self.notify.call_args.args[0])
+        self.assertTrue(all(row["event"] == "cta_click" for row in self.logged()))  # still logged
+
+    def test_failure_email_has_no_email_address(self):
+        self.kit.return_value = (200, json.dumps({"subscriber": {"email_address": EMAIL + " "}}))
+        self.buy()
+        self.notify.assert_called_once()
+        self.assertNotIn(EMAIL, self.notify.call_args.args[0])
+
+    def test_log_and_job_failures_dont_stop_the_sale(self):
+        self.table.return_value.put_item.side_effect = Exception("dynamo down")
+        self.lambda_client.return_value.invoke.side_effect = Exception("boom")
+        self.assertRedirect(self.buy(), self.expected_cart_link())
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_settings_failure(self):
+        self.settings.side_effect = Exception("no ssm")
+        self.assertEqual(self.buy()["statusCode"], 503)
+
+    def test_get_only(self):
+        self.assertEqual(self.buy(method="POST")["statusCode"], 405)
+        self.assertEqual(self.call({"token": TOKEN, "milestone": "started"}, path="/buy")["statusCode"], 405)
+        self.kit.assert_not_called()
+
+    def test_milestone_cta_click_still_accepted(self):
+        # An old copy of the watch page may still send it
+        self.assertEqual(self.call({"token": TOKEN, "milestone": "cta_click"})["statusCode"], 200)
+
+
 class SettingsTests(unittest.TestCase):
     PREFIX = "/zki/"
     OWN = PREFIX + "evergreen-watch/"
@@ -668,14 +812,26 @@ class SettingsTests(unittest.TestCase):
             self.OWN + "clicked-tag-id": CLICKED_TAG,
             self.OWN + "pitch-second": str(PITCH_SECOND) + "\n",
             self.OWN + "allowed-missing-marks": str(ALLOWED_MISSING),
+            self.OWN + "buy-link": TEST_SETTINGS["buy_link"] + " ",
+            self.OWN + "buy-fallback-url": TEST_SETTINGS["buy_fallback_url"],
         }
 
     def load(self, overrides=None):
         fn._settings = None
         values = dict(self.params, **(overrides or {}))
-        params = [{"Name": n, "Value": v} for n, v in values.items() if v is not None]
+        params = {n: v for n, v in values.items() if v is not None}
+
+        def get_parameters(Names, WithDecryption):
+            # Like AWS: at most 10 names per call, and only the ones asked for come back
+            if len(Names) > 10:
+                raise ClientError({"Error": {"Code": "ValidationException",
+                                             "Message": "Member must have length less than or equal to 10"}},
+                                  "GetParameters")
+            self.assertTrue(WithDecryption)
+            return {"Parameters": [{"Name": n, "Value": params[n]} for n in Names if n in params]}
+
         with mock.patch.object(fn, "ssm_client") as ssm:
-            ssm.return_value.get_parameters.return_value = {"Parameters": params}
+            ssm.return_value.get_parameters.side_effect = get_parameters
             result = fn.settings()
             fn.settings()
         return result, ssm
@@ -683,7 +839,8 @@ class SettingsTests(unittest.TestCase):
     def test_loads_once_and_strips(self):
         cfg, ssm = self.load()
         self.assertEqual(cfg, SECRETS)
-        ssm.return_value.get_parameters.assert_called_once()
+        # 11 settings: two calls the first time, none the second (loaded once per container)
+        self.assertEqual(ssm.return_value.get_parameters.call_count, 2)
 
     def test_each_setting_required(self):
         for name in self.params:
@@ -701,7 +858,12 @@ class SettingsTests(unittest.TestCase):
                           (self.OWN + "pitch-second", "0"),
                           (self.OWN + "pitch-second", "999999"),
                           (self.OWN + "allowed-missing-marks", "-1"),
-                          (self.OWN + "allowed-missing-marks", "one")]:
+                          (self.OWN + "allowed-missing-marks", "one"),
+                          (self.OWN + "buy-link", "http://timer.example.com/t/{email}"),
+                          (self.OWN + "buy-link", "https://timer.example.com/t/abc123"),
+                          (self.OWN + "buy-link", "https://timer.example.com/{email}/{email}"),
+                          (self.OWN + "buy-link", "https://timer.example.com/t/{email}#x"),
+                          (self.OWN + "buy-fallback-url", "www.example.com/try-again")]:
             with self.assertRaises(RuntimeError, msg=f"{name} = {bad}"):
                 self.load({name: bad})
 

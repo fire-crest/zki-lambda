@@ -48,9 +48,6 @@
   // Lambda only accepts marks at 10, 20, 30... minutes.
   var LOG_EVERY = 600;
 
-  // Where the buy button goes (the subscriber's token is added automatically)
-  var SALES_URL = "https://YOUR-SALES-PAGE-ADDRESS";
-
   /* ===================== Nothing below needs editing ===================== */
 
   // A jump of more than this many seconds between position updates means the
@@ -97,17 +94,13 @@
 
   // ---- Buy button ----
 
+  // A plain link to the same function's /buy address. It logs the click, looks
+  // up the email in Kit and sends the browser on to the Countdown Hero trigger
+  // link, which starts the cart timer and opens the sales page.
   var cta = document.getElementById("eg-cta");
   var buy = document.getElementById("eg-buy");
-  var salesLink = SALES_URL;
-  if (token) {
-    salesLink += (SALES_URL.indexOf("?") === -1 ? "?" : "&") + "indiv_token=" + encodeURIComponent(token);
-  }
-  buy.href = salesLink;
-  buy.addEventListener("click", function () {
-    // Don't stop the link: the sales page opens straight away while this is sent
-    sendOnce("cta_click", "cta_click");
-  });
+  buy.href = MILESTONE_URL.replace(/\/milestone\/?$/, "/buy") +
+    (token ? "?indiv_token=" + encodeURIComponent(token) : "");
 
   function revealBuyButton() {
     cta.hidden = false;
