@@ -2,7 +2,10 @@
 
 Records how far each viewer gets through the evergreen SMS webinar. The watch
 page calls it at each milestone. Every milestone is written to the DynamoDB
-event log, and the two important ones are also recorded in Kit.
+event log, and the important ones are also recorded in Kit.
+
+It also counts visits to the registration page and the sales page
+([Page views](#page-views) below). Those only go to the event log, never to Kit.
 
 New for the evergreen funnel. The page can't choose which tag to apply, so it
 can never apply a purchase tag or anything else. (The WordPress plugin's `/kit/`
@@ -11,6 +14,7 @@ and `/kittag/` replay endpoints are separate and not yet migrated; see the main 
 ```mermaid
 flowchart TD
     Page["Watch page<br/>(allowed website)"] -->|"1. POST /milestone<br/>token + milestone"| Fn
+    Views["Registration and<br/>sales pages"] -->|"POST /page-view<br/>log only"| Fn
     subgraph AWS
         Fn["Lambda: page mode<br/>checks token + website"]
         Job["Lambda: job mode<br/>(background run)"]
@@ -19,7 +23,7 @@ flowchart TD
     end
     Fn -->|"2. write event row"| DB
     Fn -->|"3. reply 200"| Page
-    Fn -->|"4. started / reached_pitch only"| Job
+    Fn -->|"4. started / reached_pitch / cta_click only"| Job
     Job -->|"5. tag; +1 to watch count,<br/>once per run"| Kit["Kit API v4"]
     Job -->|"find start of latest run,<br/>mark it counted"| DB
     Job -. "Kit busy: automatic retries<br/>still failing: email" .-> SNS
@@ -50,6 +54,39 @@ The replies are:
 - `400`: unknown milestone, or a minute that isn't 10, 20, 30… up to 240.
 - `403`: invalid token, or a call from another website.
 - `503`: temporary problem. Details are emailed to admin.
+
+## Page views
+
+The registration page and sales page each have a tiny block (in
+[`page-views/`](page-views/), with its own README) that calls `POST /page-view`
+once per page load:
+
+```json
+{ "page": "registration", "utm_source": "meta", "utm_campaign": "..." }
+{ "page": "sales", "token": "<indiv_token>", "utm_source": "email" }
+```
+
+| Page | Row logged | Under `subscriber_id` | Extra attributes |
+|---|---|---|---|
+| `registration` | `registration_page_view` | `registration_page` (visitors haven't registered yet) | UTMs |
+| `sales`, good token | `sales_page_visit` | the subscriber | `token_status` = `valid`, UTMs |
+| `sales`, no token | `sales_page_visit` | `sales_page` | `token_status` = `missing`, UTMs |
+| `sales`, bad token | `sales_page_visit` | `sales_page` | `token_status` = `invalid`, UTMs |
+
+- **UTMs:** `utm_source`, `utm_medium`, `utm_campaign` and `utm_content` from
+  the page's own address. Each is kept if it's printable text of up to 100
+  characters, and left out otherwise. This gives registration page conversion
+  **by source** once registrations carry their UTMs too.
+- **Every load counts.** There's no visitor ID or cookie, so the log's
+  registration page conversion is the low estimate (GA4's is the high one).
+- **Sales visits without a usable token still count**, so a cart email link
+  that's missing its token shows up as `missing` instead of disappearing. A bad
+  token isn't emailed to admin: an old link is expected now and then.
+- **No token is needed for the registration page**, so anyone could call it
+  directly and inflate the view count. The website check stops other sites'
+  pages; the worst case is a wrong metric, never a wrong tag (accepted 9 Nov).
+- Replies: `200` logged; `400` unknown page or bad body; `403` another website;
+  `503` the log couldn't be written (admin is emailed).
 
 A blank or non-numeric watch count counts as 0. The tag IDs, field name and
 allowed website all come from Parameter Store (step 2 below), so none of them
@@ -104,16 +141,23 @@ buying. It can never exceed the registration count, which counts runs started.
 |---|---|---|
 | `subscriber_id` | `1234567890` | partition key |
 | `event_at` | `2026-11-06T14:12:03.123Z#a1b2c3` | sort key: UTC time, plus a random suffix so two events in the same millisecond don't collide |
-| `event` | `started`, `progress`, `reached_pitch`, `cta_click` | |
+| `subscriber_id` (page views) | `registration_page`, `sales_page` | anonymous page views (see [Page views](#page-views)) |
+| `event` | `started`, `progress`, `reached_pitch`, `cta_click`, `registration_page_view`, `sales_page_visit` | |
 | `minute` | `20` | `progress` only |
 | `qualified` | `true` | `reached_pitch` only: whether they watched properly |
 | `missing_marks` | `[70]` | `reached_pitch` only: the required marks they hadn't played through |
-| `source` | `watch_page` | |
+| `source` | `watch_page`, `registration_page`, `sales_page` | |
+| `utm_source`, `utm_medium`, `utm_campaign`, `utm_content` | `meta` | page views only, when the address had them |
+| `token_status` | `valid`, `missing`, `invalid` | `sales_page_visit` only |
 | `pitch_counted_at` | `2026-11-07T10:20:01+00:00` | on `registered` rows only: set when that registration's watch has been counted |
 
 The index `by_event` (partition `event`, sort `event_at`) answers "all `started` events between two dates". Rows
-contain Kit subscriber IDs only, never email addresses. Later steps add more
-event types (registrations, sales page visits, purchases) to the same table.
+contain Kit subscriber IDs only, never email addresses. Registrations come
+from `evergreen-sms-webinar-registration`; later steps add purchases to the same table.
+
+**Sales page visitors:** count distinct `subscriber_id`s over `sales_page_visit`
+rows with `token_status` = `valid`. The anonymous `sales_page` rows can't be
+matched to a person or a run; watch their number for broken links.
 
 **Drop-off curve:** count *distinct* `subscriber_id`s per `minute` over the
 `progress` rows. Someone who re-watches logs the same minutes again.
@@ -127,6 +171,9 @@ event types (registrations, sales page visits, purchases) to the same table.
 | `test_lambda_function.py` | Tests (`python3 -m unittest -v`). No AWS or Kit needed. The event log tests also need `pip install "moto[dynamodb]"`, and are skipped without it |
 | `watch-page/watch-page.html` | The watch page block: video, tracking and buy button. Paste into a Kajabi Custom Code block |
 | `watch-page/README.md` | How the page works, its settings, and how to test it in a browser |
+| `page-views/registration-page.html` | Registration page view counter. Paste into a Kajabi Custom Code block on that page |
+| `page-views/sales-page.html` | Sales page visit counter. Paste into a Kajabi Custom Code block on that page |
+| `page-views/README.md` | How to add the counters and test them |
 
 It needs the same `cryptography-py313-arm64` layer as `kit-set-indiv-token`.
 
@@ -263,8 +310,10 @@ aws lambda add-permission --function-name evergreen-sms-webinar-watch --statemen
 aws lambda add-permission --function-name evergreen-sms-webinar-watch --statement-id FunctionURLInvokeAllowPublicAccess --action lambda:InvokeFunction --principal "*" --invoked-via-function-url
 ```
 
-The endpoint is the Function URL followed by `milestone`, e.g.
-`https://abc123….lambda-url.REGION.on.aws/milestone`.
+The watch page's endpoint is the Function URL followed by `milestone`, e.g.
+`https://abc123….lambda-url.REGION.on.aws/milestone`. The registration and sales
+pages use the same Function URL followed by `page-view`. All three pages must be
+on the `allowed-origin` website.
 
 ---
 
@@ -307,7 +356,18 @@ repeat calls 2 and 5; then the watch count goes up by 1.
 registration form: `200`, not qualified, no tag, no change to their watch
 count, and a failure email saying they had no run on record.
 
-To test the real page in a browser, see [`watch-page/README.md`](watch-page/README.md).
+**Page views.** POST to `…on.aws/page-view`:
+
+| # | Body | Expect |
+|---|---|---|
+| 10 | `{"page": "registration", "utm_source": "test"}` | `200`. A `registration_page_view` row under `registration_page`, with `utm_source` |
+| 11 | `{"page": "sales", "token": "TOKEN"}` | `200`. A `sales_page_visit` row under the subscriber, `token_status` `valid`. Nothing changes in Kit |
+| 12 | `{"page": "sales"}` | `200`. A row under `sales_page`, `token_status` `missing` |
+| 13 | `{"page": "sales", "token": "TOKEN-WITH-ONE-LETTER-CHANGED"}` | `200`. A row under `sales_page`, `token_status` `invalid` |
+| 14 | `{"page": "watch"}` | `400` |
+
+To test the real pages in a browser, see [`watch-page/README.md`](watch-page/README.md)
+and [`page-views/README.md`](page-views/README.md).
 
 **Website check.** Open any other website (e.g. `https://example.com`), open the
 browser's developer console (View → Developer → JavaScript Console in Chrome)

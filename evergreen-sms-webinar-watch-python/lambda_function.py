@@ -33,6 +33,26 @@ qualified = true/false, with missing_marks listing any that were missing. Only
 a qualified pitch is tagged and counted. Someone with no run on record can't
 qualify: the pitch is logged as not qualified and admin is emailed.
 
+The registration page and the sales page call the same Function URL once per
+page load, to count visits. These only write to the event log; they never call Kit:
+
+    POST /page-view
+    {"page": "registration", "utm_source": "...", ...}
+    {"page": "sales", "token": "<indiv_token>", "utm_source": "...", ...}
+
+  registration  logs registration_page_view. Visitors haven't registered yet,
+                so the row's subscriber_id is "registration_page"
+  sales         logs sales_page_visit under the subscriber from the token, with
+                token_status "valid". With no token, or one that doesn't check out,
+                the row goes under "sales_page" with token_status "missing" or
+                "invalid", so broken links still show up in the counts
+
+Both pages may also send utm_source, utm_medium, utm_campaign and utm_content
+(from their own address). Each is stored on the row if it's short, printable
+text; anything else is left out. Every page load is counted: there's no visitor
+ID or cookie, so the registration page conversion read from the log is a low
+estimate (the GA4 figure is the high one).
+
 A "run" is one watch-and-purchase window. It starts with a registration made
 while no window was open; evergreen-sms-webinar-registration marks that
 'registered' row new_run = true. Re-registering while a window is open doesn't
@@ -123,6 +143,14 @@ MAX_BODY_BYTES = 2000
 
 MILESTONES = ("started", "progress", "reached_pitch", "cta_click")
 
+# page -> (event logged, source on the row; also the subscriber_id of anonymous rows)
+PAGE_VIEWS = {
+    "registration": ("registration_page_view", "registration_page"),
+    "sales": ("sales_page_visit", "sales_page"),
+}
+UTM_FIELDS = ("utm_source", "utm_medium", "utm_campaign", "utm_content")
+MAX_UTM_LENGTH = 100
+
 _clients = {}
 _settings = None
 
@@ -155,7 +183,8 @@ def handle_page_call(event, context):
     http = event["requestContext"].get("http", {})
     if http.get("method") != "POST":
         return respond(405, "POST only")
-    if event.get("rawPath", "").rstrip("/") != "/milestone":
+    path = event.get("rawPath", "").rstrip("/")
+    if path not in ("/milestone", "/page-view"):
         return respond(404, "Not found")
 
     try:
@@ -174,6 +203,12 @@ def handle_page_call(event, context):
     if request is None:
         return respond(400, "Bad request")
 
+    if path == "/page-view":
+        return record_page_view(request, cfg)
+    return record_milestone(request, cfg, context)
+
+
+def record_milestone(request, cfg, context):
     milestone = request.get("milestone")
     if milestone not in MILESTONES:
         return respond(400, "Unknown milestone")
@@ -217,6 +252,50 @@ def handle_page_call(event, context):
     return respond(200, "OK")
 
 
+def record_page_view(request, cfg):
+    """Log one load of the registration or sales page. Never calls Kit."""
+    page = request.get("page")
+    if not isinstance(page, str) or page not in PAGE_VIEWS:
+        return respond(400, "Unknown page")
+    event_type, source = PAGE_VIEWS[page]
+
+    details = utm_values(request)
+    subscriber_id = source  # anonymous unless a good token says who it is
+    if page == "sales":
+        token = request.get("token")
+        if token is None or token == "":
+            details["token_status"] = "missing"
+        else:
+            found = read_token(token, cfg["token_secret"])
+            if found is None:
+                logger.warning("Sales page visit with an invalid token")
+                details["token_status"] = "invalid"
+            else:
+                subscriber_id = found
+                details["token_status"] = "valid"
+
+    try:
+        log_event(subscriber_id, event_type, source=source, details=details)
+    except Exception as error:
+        notify_failure(f"Could not write {event_type} event for {subscriber_id} to {EVENTS_TABLE}: {error}")
+        return respond(503, "Service temporarily unavailable")
+
+    logger.info("Recorded %s for %s", event_type, subscriber_id)
+    return respond(200, "OK")
+
+
+def utm_values(request):
+    """The UTM values sent with a page view, trimmed. Anything that isn't short, printable text is left out."""
+    values = {}
+    for name in UTM_FIELDS:
+        value = request.get(name)
+        if isinstance(value, str):
+            value = value.strip()
+            if value and len(value) <= MAX_UTM_LENGTH and value.isprintable():
+                values[name] = value
+    return values
+
+
 def read_body(event):
     """Return the request body as a dict, or None if it isn't a small JSON object."""
     body = event.get("body") or ""
@@ -231,7 +310,7 @@ def read_body(event):
     return data if isinstance(data, dict) else None
 
 
-def log_event(subscriber_id, event_type, minute=None):
+def log_event(subscriber_id, event_type, minute=None, source="watch_page", details=None):
     """Write one row to the event log. Returns its event_at (the row's sort key)."""
     now = datetime.now(timezone.utc)
     item = {
@@ -240,10 +319,12 @@ def log_event(subscriber_id, event_type, minute=None):
         # events in the same millisecond from overwriting each other
         "event_at": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z#{secrets.token_hex(3)}",
         "event": event_type,
-        "source": "watch_page",
+        "source": source,
     }
     if minute is not None:
         item["minute"] = minute
+    for name, value in (details or {}).items():
+        item.setdefault(name, value)  # can't overwrite the key or event fields
     events_table().put_item(Item=item)
     return item["event_at"]
 

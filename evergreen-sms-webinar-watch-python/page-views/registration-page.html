@@ -1,0 +1,34 @@
+<!--
+  Evergreen SMS webinar: registration page view counter
+
+  Paste this whole file into ONE Kajabi "Custom Code" block on the registration page.
+  It shows nothing on the page. Each time the page loads, it logs a
+  registration_page_view row (with any UTMs in the page address) to the event log.
+
+  Only edit the SETTINGS section below.
+-->
+
+<script>
+(function () {
+  /* ======================= SETTINGS: edit this only ======================= */
+
+  // Your evergreen-sms-webinar-watch Function URL, then "page-view"
+  var PAGE_VIEW_URL = "https://YOUR-FUNCTION-URL.lambda-url.REGION.on.aws/page-view";
+
+  /* ===================== Nothing below needs editing ===================== */
+
+  var params = new URLSearchParams(window.location.search);
+  var body = { page: "registration" };
+  ["utm_source", "utm_medium", "utm_campaign", "utm_content"].forEach(function (name) {
+    var value = params.get(name);
+    if (value) body[name] = value;
+  });
+
+  fetch(PAGE_VIEW_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    keepalive: true // finish sending even if the visitor leaves straight away
+  }).catch(function () { /* a missed page view isn't worth bothering the visitor about */ });
+})();
+</script>

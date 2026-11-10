@@ -83,7 +83,9 @@ def page_call(body, path="/milestone", method="POST", origin=ORIGIN):
     }
 
 
-class PageTests(unittest.TestCase):
+class PageFakes:
+    """Fakes AWS for calls from the web pages. Mixed into the page test classes."""
+
     def setUp(self):
         patchers = [
             mock.patch.object(fn, "settings", return_value=SECRETS),
@@ -104,6 +106,8 @@ class PageTests(unittest.TestCase):
     def jobs(self):
         return [json.loads(c.kwargs["Payload"]) for c in self.lambda_client.return_value.invoke.call_args_list]
 
+
+class PageTests(PageFakes, unittest.TestCase):
     def test_started_logs_and_starts_kit_job(self):
         result = self.call({"token": TOKEN, "milestone": "started"})
         self.assertEqual(result["statusCode"], 200)
@@ -202,6 +206,115 @@ class PageTests(unittest.TestCase):
     def test_no_cors_headers_added_by_function(self):
         result = self.call({"token": TOKEN, "milestone": "started"})
         self.assertFalse(any(h.lower().startswith("access-control") for h in result["headers"]))
+
+
+UTMS = {"utm_source": "test_source", "utm_medium": "test_medium",
+        "utm_campaign": "test_campaign", "utm_content": "test_content"}
+
+
+class PageViewTests(PageFakes, unittest.TestCase):
+    """POST /page-view from the registration and sales pages."""
+
+    def call(self, body, path="/page-view", **kwargs):
+        return fn.lambda_handler(page_call(body, path=path, **kwargs), CONTEXT)
+
+    def test_registration_view_logged_anonymously_with_utms(self):
+        result = self.call({"page": "registration", **UTMS})
+        self.assertEqual(result["statusCode"], 200)
+        [row] = self.logged()
+        self.assertEqual((row["subscriber_id"], row["event"], row["source"]),
+                         ("registration_page", "registration_page_view", "registration_page"))
+        self.assertEqual({k: row[k] for k in UTMS}, UTMS)
+        self.assertNotIn("token_status", row)
+        self.assertRegex(row["event_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z#[0-9a-f]{6}$")
+        self.assertEqual(self.jobs(), [])
+
+    def test_registration_view_without_utms(self):
+        self.assertEqual(self.call({"page": "registration"})["statusCode"], 200)
+        [row] = self.logged()
+        self.assertFalse(any(k.startswith("utm_") for k in row))
+
+    def test_registration_view_ignores_a_token(self):
+        self.call({"page": "registration", "token": TOKEN})
+        [row] = self.logged()
+        self.assertEqual(row["subscriber_id"], "registration_page")
+
+    def test_sales_visit_with_good_token_logged_under_subscriber(self):
+        self.assertEqual(self.call({"page": "sales", "token": TOKEN, "utm_source": "email"})["statusCode"], 200)
+        [row] = self.logged()
+        self.assertEqual((row["subscriber_id"], row["event"], row["source"], row["token_status"]),
+                         (SUB, "sales_page_visit", "sales_page", "valid"))
+        self.assertEqual(row["utm_source"], "email")
+        self.assertEqual(self.jobs(), [])
+
+    def test_sales_visit_without_token_still_counted(self):
+        for body in [{"page": "sales"}, {"page": "sales", "token": ""}, {"page": "sales", "token": None}]:
+            self.assertEqual(self.call(body)["statusCode"], 200, body)
+        rows = self.logged()
+        self.assertEqual({(r["subscriber_id"], r["token_status"]) for r in rows}, {("sales_page", "missing")})
+        self.assertEqual(len(rows), 3)
+
+    def test_sales_visit_with_bad_token_still_counted(self):
+        tampered = TOKEN[:-1] + ("A" if TOKEN[-1] != "A" else "B")
+        for token in ["abc", tampered, kit_token.make_token(SUB, OTHER_KEY), SUB, 12345, ["x"]]:
+            self.assertEqual(self.call({"page": "sales", "token": token})["statusCode"], 200, token)
+        rows = self.logged()
+        self.assertEqual({(r["subscriber_id"], r["token_status"]) for r in rows}, {("sales_page", "invalid")})
+        self.assertEqual(len(rows), 6)
+        self.notify.assert_not_called()  # a stale link isn't an error worth an email
+
+    def test_bad_utms_left_out(self):
+        self.call({"page": "registration", "utm_source": "x" * 101, "utm_medium": "  ", "utm_campaign": 5,
+                   "utm_content": "line\nbreak", "utm_term": "not stored"})
+        [row] = self.logged()
+        self.assertFalse(any(k.startswith("utm_") for k in row))
+
+    def test_utms_trimmed_and_longest_kept(self):
+        self.call({"page": "registration", "utm_source": "  meta  ", "utm_campaign": "c" * 100})
+        [row] = self.logged()
+        self.assertEqual((row["utm_source"], row["utm_campaign"]), ("meta", "c" * 100))
+
+    def test_page_cannot_overwrite_row_fields(self):
+        self.call({"page": "sales", "token": TOKEN, "subscriber_id": "999", "event": "purchase",
+                   "event_at": "x", "source": "kajabi", "token_status": "valid", "minute": 70})
+        [row] = self.logged()
+        self.assertEqual((row["subscriber_id"], row["event"], row["source"]), (SUB, "sales_page_visit", "sales_page"))
+        self.assertNotEqual(row["event_at"], "x")
+        self.assertNotIn("minute", row)
+
+    def test_unknown_page_refused(self):
+        for page in ["watch", "Sales", "", None, 1, ["sales"]]:
+            self.assertEqual(self.call({"page": page})["statusCode"], 400, page)
+        self.assertEqual(self.logged(), [])
+
+    def test_page_view_is_not_a_milestone(self):
+        # Each path only accepts its own kind of call
+        self.assertEqual(self.call({"token": TOKEN, "milestone": "started"})["statusCode"], 400)
+        self.assertEqual(self.call({"page": "sales", "token": TOKEN}, path="/milestone")["statusCode"], 400)
+        self.assertEqual(self.logged(), [])
+
+    def test_other_websites_refused(self):
+        for origin in near_miss_origins(ORIGIN):
+            self.assertEqual(self.call({"page": "registration"}, origin=origin)["statusCode"], 403, origin)
+        self.assertEqual(self.logged(), [])
+
+    def test_allowed_origin_and_trailing_slash(self):
+        self.assertEqual(self.call({"page": "registration"}, origin=ORIGIN + "/")["statusCode"], 200)
+        self.assertEqual(self.call({"page": "registration"}, path="/page-view/")["statusCode"], 200)
+
+    def test_wrong_method_and_body(self):
+        self.assertEqual(self.call({"page": "registration"}, method="GET")["statusCode"], 405)
+        for body in ["not json", "[1,2]", "x" * 3000]:
+            self.assertEqual(self.call(body)["statusCode"], 400, body[:10])
+
+    def test_log_failure_reported(self):
+        self.table.return_value.put_item.side_effect = Exception("dynamo down")
+        self.assertEqual(self.call({"page": "registration"})["statusCode"], 503)
+        self.notify.assert_called_once()
+
+    def test_settings_failure(self):
+        self.settings.side_effect = Exception("no ssm")
+        self.assertEqual(self.call({"page": "registration"})["statusCode"], 503)
 
 
 class FakeKit:
@@ -446,6 +559,18 @@ class EventLogTests(unittest.TestCase):
         if new_run is not None:
             item["new_run"] = new_run
         fn.events_table().put_item(Item=item)
+
+    def test_page_view_rows_written_and_kept_apart_from_subscribers(self):
+        self.put(SUB, "2026-01-01T10:00:00.000Z#a", "registered", True)
+        fn.log_event("registration_page", "registration_page_view", source="registration_page",
+                     details={"utm_source": "test_source"})
+        fn.log_event(SUB, "sales_page_visit", source="sales_page", details={"token_status": "valid"})
+        [view] = fn.events_table().query(KeyConditionExpression=fn.Key("subscriber_id").eq("registration_page"))["Items"]
+        self.assertEqual((view["event"], view["source"], view["utm_source"]),
+                         ("registration_page_view", "registration_page", "test_source"))
+        rows = fn.events_table().query(KeyConditionExpression=fn.Key("subscriber_id").eq(SUB))["Items"]
+        self.assertEqual([r["event"] for r in rows], ["registered", "sales_page_visit"])
+        self.assertEqual(fn.latest_run_start(SUB), "2026-01-01T10:00:00.000Z#a")  # visits don't disturb runs
 
     def test_finds_start_of_latest_run_among_other_events(self):
         self.put(SUB, "2026-01-01T10:00:00.000Z#a", "registered", True)
