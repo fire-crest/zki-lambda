@@ -40,6 +40,11 @@ TEST_SETTINGS = {
     "allowed_missing_marks": os.environ.get("TEST_ALLOWED_MISSING_MARKS", "1"),
     "buy_link": os.environ.get("TEST_BUY_LINK", "https://timer.example.com/t/abc123/{email}"),
     "buy_fallback_url": os.environ.get("TEST_BUY_FALLBACK_URL", "https://www.example.com/try-again"),
+    "in_cart_tag_id": os.environ.get("TEST_IN_CART_TAG_ID", "1000004"),
+    "cart_watch_link": os.environ.get("TEST_CART_WATCH_LINK", "https://timer.example.com/p/def456/{email}"),
+    "expired_url": os.environ.get("TEST_EXPIRED_URL", "https://www.example.com/expired"),
+    "watch_expired_error_url": os.environ.get("TEST_WATCH_EXPIRED_ERROR_URL",
+                                              "https://www.example.com/replay-try-again"),
 }
 SUB = os.environ.get("TEST_SUBSCRIBER_ID", "1234567890")
 
@@ -794,6 +799,175 @@ class BuyTests(PageFakes, unittest.TestCase):
         self.assertEqual(self.call({"token": TOKEN, "milestone": "cta_click"})["statusCode"], 200)
 
 
+def watch_expired_call(query, method="GET"):
+    return {
+        "rawPath": "/watch-expired",
+        "rawQueryString": "&".join(f"{k}={v}" for k, v in (query or {}).items()),
+        "queryStringParameters": query,
+        "headers": {},
+        "requestContext": {"http": {"method": method, "sourceIp": "1.2.3.4"}},
+        "isBase64Encoded": False,
+    }
+
+
+IN_CART_TAG = TEST_SETTINGS["in_cart_tag_id"]
+
+
+def tags_reply(tag_ids, has_next=False, end_cursor="cursor1", status=200):
+    return status, json.dumps({"tags": [{"id": int(t), "name": f"tag {t}", "tagged_at": "2026-11-10T10:00:00Z"}
+                                        for t in tag_ids],
+                               "pagination": {"has_previous_page": False, "has_next_page": has_next,
+                                              "start_cursor": "c0", "end_cursor": end_cursor, "per_page": 1000}})
+
+
+class WatchExpiredTests(PageFakes, unittest.TestCase):
+    """GET /watch-expired: where the watch timer's expired redirect goes."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(fn, "kit_request")
+        self.kit = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def expire(self, query={"indiv_token": TOKEN, "email": EMAIL, "utm_source": "me"}, **kwargs):
+        with self.assertLogs(fn.logger, level="INFO") as logs:
+            fn.logger.info("start")
+            result = fn.lambda_handler(watch_expired_call(query, **kwargs), CONTEXT)
+        self.log_lines = "\n".join(logs.output)
+        return result
+
+    def assertRedirect(self, result, location):
+        self.assertEqual(result["statusCode"], 302)
+        self.assertEqual(result["headers"]["Location"], location)
+        self.assertEqual(result["headers"]["Cache-Control"], "no-store")
+
+    def replay_link(self):
+        return (TEST_SETTINGS["cart_watch_link"].replace("{email}", quote(EMAIL, safe="@+"))
+                + "?indiv_token=" + quote(TOKEN, safe=""))
+
+    def error_link(self):
+        return TEST_SETTINGS["watch_expired_error_url"] + "?indiv_token=" + quote(TOKEN, safe="")
+
+    def outcome(self, subscriber_id=SUB):
+        [row] = self.logged()
+        self.assertEqual((row["subscriber_id"], row["event"], row["source"]),
+                         (subscriber_id, "watch_expired_redirect", "watch_expired"))
+        return row["outcome"]
+
+    def test_cart_open_goes_back_to_replay(self):
+        self.kit.side_effect = [tags_reply(["111", IN_CART_TAG]), kit_reply()]
+        self.assertRedirect(self.expire(), self.replay_link())
+        self.assertEqual(self.kit.call_args_list[0].args[:2],
+                         ("GET", f"subscribers/{SUB}/tags?per_page={fn.KIT_TAGS_PER_PAGE}"))
+        self.assertEqual(self.kit.call_args_list[1].args[:2], ("GET", f"subscribers/{SUB}"))
+        self.assertTrue(all(c.kwargs["timeout"] == fn.BUY_KIT_TIMEOUT_SECONDS for c in self.kit.call_args_list))
+        self.assertEqual(self.outcome(), "cart")
+        self.notify.assert_not_called()
+
+    def test_no_cart_goes_to_expired_without_asking_for_email(self):
+        self.kit.side_effect = [tags_reply(["111", "222"])]
+        self.assertRedirect(self.expire(), TEST_SETTINGS["expired_url"])
+        self.assertEqual(self.kit.call_count, 1)
+        self.assertEqual(self.outcome(), "expired")
+        self.notify.assert_not_called()
+
+    def test_no_tags_at_all(self):
+        self.kit.side_effect = [tags_reply([])]
+        self.assertRedirect(self.expire(), TEST_SETTINGS["expired_url"])
+
+    def test_tag_found_on_a_later_page(self):
+        self.kit.side_effect = [tags_reply(["111"], has_next=True, end_cursor="abc"),
+                                tags_reply([IN_CART_TAG]), kit_reply()]
+        self.assertRedirect(self.expire(), self.replay_link())
+        self.assertIn("after=abc", self.kit.call_args_list[1].args[1])
+
+    def test_ignores_the_email_in_the_address(self):
+        # Only the token says who it is: a typed-in email can't open someone else's cart
+        self.kit.side_effect = [tags_reply([IN_CART_TAG]), kit_reply()]
+        result = self.expire({"indiv_token": TOKEN, "email": "someone.else@example.com"})
+        self.assertRedirect(result, self.replay_link())
+        self.assertNotIn("someone.else", result["headers"]["Location"])
+
+    def test_email_never_logged_or_stored(self):
+        self.kit.side_effect = [tags_reply([IN_CART_TAG]), kit_reply()]
+        self.expire()
+        self.assertNotIn(EMAIL, self.log_lines)
+        self.assertNotIn(EMAIL, json.dumps(self.logged()))
+
+    def test_missing_and_invalid_tokens_go_to_expired(self):
+        bad = kit_token.make_token(SUB, OTHER_KEY)
+        for query, status in [(None, "missing"), ({}, "missing"), ({"indiv_token": ""}, "missing"),
+                              ({"email": EMAIL}, "missing"),
+                              ({"indiv_token": bad}, "invalid"), ({"indiv_token": "junk"}, "invalid")]:
+            self.table.reset_mock()
+            self.assertRedirect(self.expire(query), TEST_SETTINGS["expired_url"])
+            self.assertEqual(self.outcome("watch_expired"), "expired")
+            self.assertEqual(self.logged()[0]["token_status"], status, query)
+        self.kit.assert_not_called()
+        self.notify.assert_not_called()
+
+    def test_kit_busy_then_ok(self):
+        self.kit.side_effect = [(503, "busy"), tags_reply([IN_CART_TAG]), fn.RetryableError("x"), kit_reply()]
+        self.assertRedirect(self.expire(), self.replay_link())
+        self.notify.assert_not_called()
+
+    def test_tags_unreadable_goes_to_try_again_page(self):
+        for side_effect in [[(429, "slow"), (500, "err")],
+                            [fn.RetryableError("x"), fn.RetryableError("y")],
+                            [(404, "not found")],
+                            [(200, "not json")],
+                            [(200, json.dumps({"no": "tags"}))]]:
+            self.kit.reset_mock(side_effect=True)
+            self.notify.reset_mock()
+            self.table.reset_mock()
+            self.kit.side_effect = side_effect
+            self.assertRedirect(self.expire(), self.error_link())
+            self.assertEqual(self.outcome(), "error")
+            self.notify.assert_called_once()
+            self.assertIn(SUB, self.notify.call_args.args[0])
+
+    def test_email_unavailable_goes_to_try_again_page(self):
+        for second in [[(500, "err"), (500, "err")], [kit_reply(email="")], [kit_reply(email=None)]]:
+            self.kit.reset_mock(side_effect=True)
+            self.notify.reset_mock()
+            self.table.reset_mock()
+            self.kit.side_effect = [tags_reply([IN_CART_TAG])] + second
+            self.assertRedirect(self.expire(), self.error_link())
+            self.assertEqual(self.outcome(), "error")
+            self.notify.assert_called_once()
+
+    def test_too_many_tag_pages_goes_to_try_again_page(self):
+        self.kit.side_effect = [tags_reply(["111"], has_next=True)] * fn.KIT_TAG_PAGES
+        self.assertRedirect(self.expire(), self.error_link())
+        self.notify.assert_called_once()
+
+    def test_error_page_with_existing_query(self):
+        self.kit.side_effect = [(404, "x")]
+        with mock.patch.dict(SECRETS, {"watch_expired_error_url": "https://www.example.com/again?x=1"}):
+            location = self.expire()["headers"]["Location"]
+        self.assertEqual(location, "https://www.example.com/again?x=1&indiv_token=" + quote(TOKEN, safe=""))
+
+    def test_log_failure_doesnt_stop_the_redirect(self):
+        self.table.return_value.put_item.side_effect = Exception("dynamo down")
+        self.kit.side_effect = [tags_reply([IN_CART_TAG]), kit_reply()]
+        self.assertRedirect(self.expire(), self.replay_link())
+        self.notify.assert_called_once()
+
+    def test_never_tags_or_starts_jobs(self):
+        self.kit.side_effect = [tags_reply([IN_CART_TAG]), kit_reply()]
+        self.expire()
+        self.assertTrue(all(c.args[0] == "GET" for c in self.kit.call_args_list))
+        self.assertEqual(self.jobs(), [])
+
+    def test_settings_failure(self):
+        self.settings.side_effect = Exception("no ssm")
+        self.assertEqual(self.expire()["statusCode"], 503)
+
+    def test_get_only(self):
+        self.assertEqual(self.expire(method="POST")["statusCode"], 405)
+        self.kit.assert_not_called()
+
+
 class SettingsTests(unittest.TestCase):
     PREFIX = "/zki/"
     OWN = PREFIX + "evergreen-watch/"
@@ -814,6 +988,10 @@ class SettingsTests(unittest.TestCase):
             self.OWN + "allowed-missing-marks": str(ALLOWED_MISSING),
             self.OWN + "buy-link": TEST_SETTINGS["buy_link"] + " ",
             self.OWN + "buy-fallback-url": TEST_SETTINGS["buy_fallback_url"],
+            self.OWN + "in-cart-tag-id": TEST_SETTINGS["in_cart_tag_id"] + "\n",
+            self.OWN + "cart-watch-link": TEST_SETTINGS["cart_watch_link"],
+            self.OWN + "expired-url": " " + TEST_SETTINGS["expired_url"],
+            self.OWN + "watch-expired-error-url": TEST_SETTINGS["watch_expired_error_url"],
         }
 
     def load(self, overrides=None):
@@ -839,7 +1017,7 @@ class SettingsTests(unittest.TestCase):
     def test_loads_once_and_strips(self):
         cfg, ssm = self.load()
         self.assertEqual(cfg, SECRETS)
-        # 11 settings: two calls the first time, none the second (loaded once per container)
+        # 15 settings: two calls the first time, none the second (loaded once per container)
         self.assertEqual(ssm.return_value.get_parameters.call_count, 2)
 
     def test_each_setting_required(self):
@@ -863,7 +1041,14 @@ class SettingsTests(unittest.TestCase):
                           (self.OWN + "buy-link", "https://timer.example.com/t/abc123"),
                           (self.OWN + "buy-link", "https://timer.example.com/{email}/{email}"),
                           (self.OWN + "buy-link", "https://timer.example.com/t/{email}#x"),
-                          (self.OWN + "buy-fallback-url", "www.example.com/try-again")]:
+                          (self.OWN + "buy-fallback-url", "www.example.com/try-again"),
+                          (self.OWN + "in-cart-tag-id", "in_cart_window"),
+                          (self.OWN + "cart-watch-link", "https://timer.example.com/p/def456"),
+                          (self.OWN + "cart-watch-link", "http://timer.example.com/p/{email}"),
+                          (self.OWN + "cart-watch-link", "https://timer.example.com/p/{email}#x"),
+                          (self.OWN + "expired-url", "www.example.com/expired"),
+                          (self.OWN + "watch-expired-error-url", "http://www.example.com/replay-try-again"),
+                          (self.OWN + "watch-expired-error-url", "https://www.example.com/x#y")]:
             with self.assertRaises(RuntimeError, msg=f"{name} = {bad}"):
                 self.load({name: bad})
 
@@ -889,7 +1074,7 @@ class PageBlockTests(unittest.TestCase):
 
     def blocks(self):
         names = sorted(n for n in os.listdir(self.FOLDER) if n.endswith(".js"))
-        self.assertEqual(names, ["registration-page.js", "sales-page.js"])
+        self.assertEqual(names, ["registration-page.js", "replay-try-again-page.js", "sales-page.js"])
         for name in names:
             with open(os.path.join(self.FOLDER, name), encoding="utf-8") as f:
                 yield name, f.read()

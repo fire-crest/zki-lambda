@@ -75,6 +75,32 @@ A missing or invalid token is logged under subscriber_id "buy_button" with
 token_status "missing" or "invalid". The email is never logged or stored: it
 only appears in the redirect.
 
+When the watch page's own Countdown Hero timer runs out, Countdown Hero sends
+the browser to its expired page, which is set to:
+
+    GET /watch-expired?indiv_token=<indiv_token>
+
+(Countdown Hero passes on the watch page's query string, so the token arrives
+with it. It also adds the email; that's ignored, because anyone can type an
+email into an address but only a real token checks out.) The cart can outlast
+the watch window, so someone whose cart is still open keeps the replay:
+
+  1. reads the subscriber from the token
+  2. asks Kit whether they have <in-cart-tag-id> (trying twice, briefly)
+  3. with the tag: asks Kit for their email and redirects to <cart-watch-link>
+     (the cart timer's page link for the second copy of the watch page), with
+     {email} replaced and indiv_token added. Countdown Hero opens that copy
+     with the cart countdown on it
+  4. without it: redirects to <expired-url>
+
+A missing or invalid token goes to <expired-url> (without a token there's no
+telling who it is). If Kit can't answer, the browser goes to
+<watch-expired-error-url> with indiv_token added, so that page's button can
+send them back here to try again, and admin is emailed. Every visit logs one
+watch_expired_redirect row with outcome "cart", "expired" or "error": under the
+subscriber, or under subscriber_id "watch_expired" with token_status "missing"
+or "invalid". The email is never logged or stored.
+
 A "run" is one watch-and-purchase window. It starts with a registration made
 while no window was open; evergreen-sms-webinar-registration marks that
 'registered' row new_run = true. Re-registering while a window is open doesn't
@@ -127,6 +153,12 @@ and the function refuses to run if any of these is missing:
                                 where the email goes, e.g. https://example.com/t/abc/{email}
     buy-fallback-url            where the buy button goes if the email can't be found,
                                 e.g. https://www.example.com/try-again
+    in-cart-tag-id              Kit tag ID for "cart window open"
+    cart-watch-link             the cart Countdown Hero's page link for the second copy of
+                                the watch page, with {email} where the email goes
+    expired-url                 the "this has expired" page
+    watch-expired-error-url     where /watch-expired sends people if Kit can't answer: a page
+                                whose button sends them back to try again
 
 Lambda environment variables (all optional except FAILURE_TOPIC_ARN):
   FAILURE_TOPIC_ARN     SNS topic for failure emails
@@ -166,6 +198,8 @@ KIT_API_BASE = "https://api.kit.com/v4/"
 KIT_TIMEOUT_SECONDS = 10
 BUY_KIT_TIMEOUT_SECONDS = 4   # someone is waiting on a click: keep each try short
 BUY_KIT_ATTEMPTS = 2
+KIT_TAGS_PER_PAGE = 1000   # Kit's maximum
+KIT_TAG_PAGES = 5
 MAX_EMAIL_LENGTH = 254
 SSM_BATCH = 10   # AWS limit on names per GetParameters call
 JOB_NAME = "kit_actions"
@@ -213,10 +247,12 @@ def lambda_handler(event, context):
 def handle_page_call(event, context):
     http = event["requestContext"].get("http", {})
     path = event.get("rawPath", "").rstrip("/")
-    if path == "/buy":
+    if path in ("/buy", "/watch-expired"):
         if http.get("method") != "GET":
             return respond(405, "GET only")
-        return handle_buy(event, context)
+        if path == "/buy":
+            return handle_buy(event, context)
+        return handle_watch_expired(event)
     if http.get("method") != "POST":
         return respond(405, "POST only")
     if path not in ("/milestone", "/page-view"):
@@ -310,11 +346,66 @@ def handle_buy(event, context):
                        f"to {EVENTS_TABLE}: {error}")
     start_kit_job(subscriber_id, "cta_click", event_at, context)
 
-    email = subscriber_email(subscriber_id, cfg["kit_api_key"])
+    email, problem = subscriber_email(subscriber_id, cfg["kit_api_key"])
     if email is None:
+        notify_failure(f"Buy button: could not get the email for subscriber {subscriber_id} from Kit "
+                       f"({problem}), so they were sent to the fallback page instead of the cart")
         return redirect(cfg["buy_fallback_url"])
     logger.info("Sent subscriber %s to the cart", subscriber_id)
     return redirect(cart_link(cfg["buy_link"], email, token))
+
+
+def handle_watch_expired(event):
+    """The watch timer has run out: back to the replay if their cart is open, otherwise the expired page.
+
+    A link (Countdown Hero's expired redirect), so there's no Origin check.
+    Someone holding a token can only ever reach that subscriber's own cart.
+    """
+    try:
+        cfg = settings()
+    except Exception as error:
+        notify_failure(f"Could not load settings from Parameter Store: {error}")
+        return respond(503, "Service temporarily unavailable")
+
+    token = (event.get("queryStringParameters") or {}).get("indiv_token") or ""
+    subscriber_id = read_token(token, cfg["token_secret"]) if token else None
+    if subscriber_id is None:
+        status = "invalid" if token else "missing"
+        logger.warning("Watch window expiry with a %s token", status)
+        log_watch_expired("watch_expired", "expired", {"token_status": status})
+        return redirect(cfg["expired_url"])
+
+    in_cart, problem = subscriber_has_tag(subscriber_id, cfg["in_cart_tag_id"], cfg["kit_api_key"])
+    if in_cart is None:
+        return watch_expired_error(subscriber_id, token, cfg, f"could not read their tags ({problem})")
+    if not in_cart:
+        log_watch_expired(subscriber_id, "expired")
+        logger.info("Watch window over for subscriber %s, no cart: sent to the expired page", subscriber_id)
+        return redirect(cfg["expired_url"])
+
+    email, problem = subscriber_email(subscriber_id, cfg["kit_api_key"])
+    if email is None:
+        return watch_expired_error(subscriber_id, token, cfg, f"could not get their email ({problem})")
+    log_watch_expired(subscriber_id, "cart")
+    logger.info("Watch window over for subscriber %s, cart open: sent back to the replay", subscriber_id)
+    return redirect(cart_link(cfg["cart_watch_link"], email, token))
+
+
+def watch_expired_error(subscriber_id, token, cfg, what):
+    notify_failure(f"Watch window expiry: {what} for subscriber {subscriber_id} from Kit, so they were sent "
+                   f"to the try-again page instead of the replay or the expired page")
+    log_watch_expired(subscriber_id, "error")
+    return redirect(with_token(cfg["watch_expired_error_url"], token))
+
+
+def log_watch_expired(subscriber_id, outcome, details=None):
+    """Log one watch_expired_redirect row. A failure is reported but never stops the redirect."""
+    try:
+        log_event(subscriber_id, "watch_expired_redirect", source="watch_expired",
+                  details={"outcome": outcome, **(details or {})})
+    except Exception as error:
+        notify_failure(f"Could not write a watch_expired_redirect event ({outcome}) for {subscriber_id} "
+                       f"to {EVENTS_TABLE}: {error}")
 
 
 def start_kit_job(subscriber_id, milestone, event_at, context):
@@ -333,13 +424,12 @@ def start_kit_job(subscriber_id, milestone, event_at, context):
         return False
 
 
-def subscriber_email(subscriber_id, api_key):
-    """The subscriber's email from Kit, or None (admin is emailed). Never logs the email or Kit's reply."""
+def quick_kit_get(endpoint, api_key):
+    """GET from Kit while someone waits: two short tries. Returns (body, None) or (None, problem)."""
     problem = "no reply"
     for _ in range(BUY_KIT_ATTEMPTS):
         try:
-            status, body = kit_request("GET", f"subscribers/{subscriber_id}", None, api_key,
-                                       timeout=BUY_KIT_TIMEOUT_SECONDS)
+            status, body = kit_request("GET", endpoint, None, api_key, timeout=BUY_KIT_TIMEOUT_SECONDS)
         except RetryableError:
             problem = "a network error"
             continue
@@ -347,19 +437,44 @@ def subscriber_email(subscriber_id, api_key):
             problem = f"status {status}"
             continue
         if not 200 <= status < 300:
-            problem = f"status {status}"
-            break
+            return None, f"status {status}"
+        return body, None
+    return None, problem
+
+
+def subscriber_email(subscriber_id, api_key):
+    """(email, None), or (None, problem). Never logs the email or Kit's reply."""
+    body, problem = quick_kit_get(f"subscribers/{subscriber_id}", api_key)
+    if body is None:
+        return None, problem
+    try:
+        email = json.loads(body)["subscriber"]["email_address"]
+    except (ValueError, KeyError, TypeError):
+        email = None
+    if usable_email(email):
+        return email, None
+    return None, "a reply with no usable email"
+
+
+def subscriber_has_tag(subscriber_id, tag_id, api_key):
+    """(True or False, None), or (None, problem) if Kit couldn't say."""
+    query = {"per_page": KIT_TAGS_PER_PAGE}
+    for _ in range(KIT_TAG_PAGES):
+        body, problem = quick_kit_get(f"subscribers/{subscriber_id}/tags?{urlencode(query)}", api_key)
+        if body is None:
+            return None, problem
         try:
-            email = json.loads(body)["subscriber"]["email_address"]
-        except (ValueError, KeyError, TypeError):
-            email = None
-        if usable_email(email):
-            return email
-        problem = "a reply with no usable email"
-        break
-    notify_failure(f"Buy button: could not get the email for subscriber {subscriber_id} from Kit "
-                   f"({problem}), so they were sent to the fallback page instead of the cart")
-    return None
+            reply = json.loads(body)
+            ids = {str(tag["id"]) for tag in reply["tags"]}
+            pagination = reply.get("pagination") or {}
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, "a reply with no tag list"
+        if tag_id in ids:
+            return True, None
+        if not pagination.get("has_next_page") or not pagination.get("end_cursor"):
+            return False, None
+        query["after"] = pagination["end_cursor"]
+    return None, f"more than {KIT_TAG_PAGES * KIT_TAGS_PER_PAGE} tags"
 
 
 def usable_email(email):
@@ -368,8 +483,11 @@ def usable_email(email):
 
 
 def cart_link(template, email, token):
-    """The Countdown Hero trigger link for this subscriber, with the token passed on to the sales page."""
-    link = template.replace("{email}", quote(email, safe="@+"))
+    """A Countdown Hero link for this subscriber, with the token passed on to the Kajabi page."""
+    return with_token(template.replace("{email}", quote(email, safe="@+")), token)
+
+
+def with_token(link, token):
     return link + ("&" if "?" in link else "?") + urlencode({"indiv_token": token})
 
 
@@ -714,6 +832,10 @@ def settings():
             "allowed_missing_marks": own + "allowed-missing-marks",
             "buy_link": own + "buy-link",
             "buy_fallback_url": own + "buy-fallback-url",
+            "in_cart_tag_id": own + "in-cart-tag-id",
+            "cart_watch_link": own + "cart-watch-link",
+            "expired_url": own + "expired-url",
+            "watch_expired_error_url": own + "watch-expired-error-url",
         }
         # GetParameters takes at most SSM_BATCH names per call
         wanted = list(names.values())
@@ -725,7 +847,7 @@ def settings():
         if missing:
             raise RuntimeError(f"Missing or empty parameters: {', '.join(missing)}")
         loaded = {key: found[name].strip() for key, name in names.items()}
-        for key in ("started_tag_id", "watched_tag_id", "clicked_tag_id"):
+        for key in ("started_tag_id", "watched_tag_id", "clicked_tag_id", "in_cart_tag_id"):
             if not loaded[key].isdigit():
                 raise RuntimeError(f"{names[key]} must be a Kit tag ID (digits only), got {loaded[key]!r}")
         if not loaded["pitch_second"].isdigit() or not 0 < int(loaded["pitch_second"]) <= MAX_PROGRESS_MINUTE * 60:
@@ -734,12 +856,17 @@ def settings():
         if not loaded["allowed_missing_marks"].isdigit():
             raise RuntimeError(f"{names['allowed_missing_marks']} must be a whole number (0 or more), "
                                f"got {loaded['allowed_missing_marks']!r}")
-        for key in ("allowed_origin", "buy_link", "buy_fallback_url"):
+        for key in ("allowed_origin", "buy_link", "buy_fallback_url", "cart_watch_link", "expired_url",
+                    "watch_expired_error_url"):
             if not loaded[key].startswith("https://"):
                 raise RuntimeError(f"{names[key]} must start with https://, got {loaded[key]!r}")
-        if loaded["buy_link"].count("{email}") != 1 or "#" in loaded["buy_link"]:
-            raise RuntimeError(f"{names['buy_link']} must contain {{email}} exactly once (where the email "
-                               f"goes) and no #, got {loaded['buy_link']!r}")
+        for key in ("buy_link", "cart_watch_link"):
+            if loaded[key].count("{email}") != 1 or "#" in loaded[key]:
+                raise RuntimeError(f"{names[key]} must contain {{email}} exactly once (where the email "
+                                   f"goes) and no #, got {loaded[key]!r}")
+        if "#" in loaded["watch_expired_error_url"]:
+            raise RuntimeError(f"{names['watch_expired_error_url']} must not contain #, "
+                               f"got {loaded['watch_expired_error_url']!r}")
         _settings = loaded
     return _settings
 
