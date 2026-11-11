@@ -5,26 +5,61 @@
   The page address must carry the subscriber's token: ...?indiv_token=XXXX
   (In Kit emails: ?indiv_token={{ subscriber.indiv_token }})
 
-  Only edit the SETTINGS section below.
+  Only edit the SETTINGS section below (and the words in the button section if you want).
 -->
 
 <div id="eg-video"></div>
 
+<!-- Hidden until the viewer reaches the pitch -->
 <div id="eg-cta" hidden>
-  <p class="eg-cta-intro"><em>YOUR INTRODUCTION TO THE BUTTON</em></p>
-  <a id="eg-buy" class="eg-buy" href="#">YOUR BUTTON TEXT</a>
+  <div class="eg-cta-box">
+    <h2>Join Schooling Made Simple™</h2>
+    <p class="eg-cta-sub">The online coaching program that's helped riders all over the world make real progress and have a genuinely happier horse:</p>
+    <a id="eg-buy" class="eg-buy btn" href="#">Join Now</a>
+  </div>
 </div>
 
 <style>
   #eg-video .wistia_responsive_wrapper { position: relative; aspect-ratio: 16 / 9; }
-  #eg-cta { text-align: center; padding: 24px 0; }
-  #eg-cta[hidden] { display: none; }
-  .eg-buy {
-    display: inline-block; padding: 16px 32px; border-radius: 999px;
-    background: #fcb900; color: #000; font-weight: 700; font-size: 1.25rem;
-    text-decoration: none; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+
+ #eg-cta {
+    margin-top: 10px;
   }
-  .eg-buy:hover { filter: brightness(0.95); }
+
+  #eg-cta[hidden] { display: none; }
+
+  /* White box with gold border */
+  .eg-cta-box {
+    max-width: 1050px;
+    margin: 0 auto;
+    background: #ffffff;
+    border: 4px solid #b08a2e;
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+  }
+  .eg-cta-box h2 { margin: 0 0 16px; }
+  .eg-cta-box .eg-cta-sub { margin-top: 24px; font-size: 1.1em; }
+
+  /* Yellow button */
+  .eg-buy {
+    display: inline-block;
+    margin-top: 1rem;
+    padding: 16px 40px;
+    border: 2px solid #f1c40f;
+    border-radius: 30px;
+    background: #f1c40f;
+    color: #2c3e50;
+    font-weight: 700;
+    font-size: 120%;
+    text-decoration: none;
+  }
+  .eg-buy:hover { filter: brightness(1.2); color: #2c3e50; }
+
+  @media (min-width: 768px) {
+    #eg-cta { padding: 20px 0; } 
+    .eg-cta-box { padding: 30px; }
+  }
 </style>
 
 <script>
@@ -36,6 +71,9 @@
 
   // The Wistia video ID (from the Wistia embed code)
   var VIDEO_ID = "YOUR-WISTIA-VIDEO-ID";
+
+  // Video player accent colour (play button, progress bar). Hex code without the #
+  var PLAYER_COLOR = "8f6f25";
 
   // Seconds of real playback before "started" is sent (stops auto-play counting)
   var T_START = 30;
@@ -111,7 +149,7 @@
   var holder = document.getElementById("eg-video");
   holder.innerHTML =
     '<div class="wistia_responsive_wrapper">' +
-    '<div class="wistia_embed wistia_async_' + VIDEO_ID + ' seo=false videoFoam=true" ' +
+    '<div class="wistia_embed wistia_async_' + VIDEO_ID + ' seo=false videoFoam=true playerColor=' + PLAYER_COLOR + '" ' +
     'style="height:100%;position:relative;width:100%"></div></div>';
   [
     "https://fast.wistia.com/embed/medias/" + VIDEO_ID + ".jsonp",
