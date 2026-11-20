@@ -1,15 +1,16 @@
-# Registration, sales and replay "try again" page blocks
+# Registration, sales and "try again" page blocks
 
 Small blocks of JavaScript that show nothing on the page. Two count
 visits for the conversion KPIs (the registration one also passes the
-visit's UTMs to Kit and keeps the email for the thank-you page). The third
-makes the replay "try again" page's button work.
+visit's UTMs to Kit and keeps the email for the thank-you page). The other
+two make the "try again" pages' buttons work.
 
 | File | Goes on | What it does |
 |---|---|---|
 | `registration-page.js` | the registration page | 1. logs `registration_page_view`, with any UTMs in the address<br>2. puts the UTMs into the Kit form as hidden fields, so the registration function can copy them onto the `registered` row (`direct` for any not in the address)<br>3. when the form is sent, keeps the email address in that browser tab for the thank-you page |
 | `sales-page.js` | the sales page | logs `sales_page_visit`: under the subscriber when the address has `?indiv_token=`, anonymously when it doesn't |
 | `replay-try-again-page.js` | the replay "try again" page (`watch-expired-error-url`) | points every button or link whose address ends in `#watch-again` at the watch function's `/watch-expired`, with the page's `indiv_token`. Logs nothing |
+| `buy-try-again-page.js` | the buy "try again" page (`buy-fallback-url`) | points every button or link whose address ends in `#buy-again` at the watch function's `/buy`, with the page's `indiv_token`; with no token, at the registration page. Logs nothing |
 
 The page view calls go to the watch function's `POST /page-view` and only
 write to the event log, never to Kit (see the function's
@@ -17,7 +18,7 @@ write to the event log, never to Kit (see the function's
 
 ## Where to paste them
 
-All three files are plain JavaScript, with **no script tags**. Paste the whole file
+All four files are plain JavaScript, with **no script tags**. Paste the whole file
 into the page's **settings → Custom Code → Custom Javascript**: Kajabi adds the
 script tags itself. (If you'd rather use a Custom Code *block* in the page
 content, add an opening and a closing script tag around it.) Then fill in the
@@ -30,8 +31,10 @@ and the block silently never runs. The tests check these files never contain one
 
 | Setting | In | What to put |
 |---|---|---|
-| `PAGE_VIEW_URL` | both | the watch function's Function URL followed by `page-view`, e.g. `https://abc123….lambda-url.eu-north-1.on.aws/page-view` (the watch page uses the same URL followed by `milestone`) |
+| `PAGE_VIEW_URL` | registration, sales | the watch function's Function URL followed by `page-view`, e.g. `https://abc123….lambda-url.eu-north-1.on.aws/page-view` (the watch page uses the same URL followed by `milestone`) |
 | `WATCH_EXPIRED_URL` | replay try again | the watch function's Function URL followed by `watch-expired` |
+| `BUY_URL` | buy try again | the watch function's Function URL followed by `buy` |
+| `NO_TOKEN_URL` | buy try again | the registration page's address |
 | `KIT_FIELDS` | registration | the **keys** of the four Kit custom fields holding the UTM source, medium, campaign and content: the key text, **not** the field's ID number, which Kit silently ignores. The same four keys, in the same order, as `/zki/evergreen-registration/utm-fields` in Parameter Store |
 
 ## The registration page
@@ -81,6 +84,27 @@ To test it: open the page with `?indiv_token=TOKEN` (the test subscriber's
 token) and click the button. You should end up where the watch function would
 send them: the replay copy if their cart is open, otherwise the expired page.
 
+## The buy "try again" page
+
+The watch function sends people here when they clicked the buy button but it
+couldn't start their cart: Kit didn't give their email, or Countdown Hero
+didn't accept the trigger (see the function's
+[README](../README.md#the-buy-button)). It adds `?indiv_token=…` to this page's
+address. Add an ordinary Kajabi button and set its link to `#buy-again`. The
+block replaces that link with `/buy?indiv_token=…`, so one click tries again
+and, if it works, lands on the checkout.
+
+The buy button also sends people here, **without** a token, if the watch page's
+token was missing or broken. Trying again can't help then, so the button goes
+to `NO_TOKEN_URL` (the registration page, where re-entering their email resends
+their viewing link). Word the page so it makes sense either way, e.g. "Something
+went wrong opening the checkout. Please click below to try again."
+
+To test it: open the page with `?indiv_token=TOKEN` (the test subscriber's
+token) and hover over the button: its address should be the function's `/buy`
+with that token. Click it: the checkout. Then open the page with no token: the
+button's address is the registration page.
+
 ## Testing
 
 Use a private window for each test, and the test subscriber's **current**
@@ -97,7 +121,7 @@ items** → `evergreen_events` → **Query** with the `subscriber_id` shown (tic
 | 3 | the sales page with `?indiv_token=TOKEN` | the test subscriber's ID | a `sales_page_visit` row with `token_status` `valid`. Their Kit tags are unchanged |
 | 4 | the sales page with no `?…` | `sales_page` | a row with `token_status` `missing` |
 | 5 | the sales page with `?indiv_token=` and the token with one letter changed | `sales_page` | a row with `token_status` `invalid` |
-| 6 | the watch page's buy button (after reaching the pitch) | the test subscriber's ID | a `cta_click` row **and** a `sales_page_visit` row |
+| 6 | the watch page's buy button (after reaching the pitch) | the test subscriber's ID | the **checkout** opens. A `cta_click` row, and **no** `sales_page_visit` row: the buy button goes straight to checkout, so the sales page is only reached from the cart emails' links |
 
 ### UTMs and the email hand-off
 

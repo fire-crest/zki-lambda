@@ -1,17 +1,20 @@
 # Watch page block
 
-`watch-page.html` is everything the watch page needs, in one block: the Wistia
-video, the viewing tracking and the buy button. It talks to the
-`evergreen-sms-webinar-watch` Lambda function.
+`watch-page.html` is everything the watch page needs, in one block: the token
+check, the Wistia video, the viewing tracking and the buy button. It talks to
+the `evergreen-sms-webinar-watch` Lambda function. The same block goes on
+**both** watch pages (A, for the watch window, and B, the replay during the
+cart window): keep them in step.
 
 ## What it does
 
 | When | What the page does | What Lambda does |
 |---|---|---|
+| The page loads | keeps the video hidden and sends its token to `/watch-view` | checks the token and logs `watch_page_view`. Good: `200`, and the page shows the video. Missing or invalid: `403` with the registration page's address, and the page goes there; admin is emailed |
 | 30 seconds actually **played** (`T_START`) | sends `started` | logs it, adds the "started" tag |
 | The video **plays across** 10:00, 20:00, 30:00… (`LOG_EVERY`) | sends `progress` with the minute | logs it (no Kit call) |
 | The position reaches the pitch (`T_PITCH`), however they got there | reveals the buy button, sends `reached_pitch` | logs it and decides whether they **watched properly** (see the function's README). If so: "watched" tag, watch count (once per run) and the cart starts |
-| The buy button is clicked | it's a plain link to the function's `/buy` address, with the token | logs `cta_click`, adds the "clicked buy" tag, looks up the email in Kit and sends the browser to the Countdown Hero trigger link, which starts the cart timer and opens the sales page. If the email can't be found: the "please click again" page |
+| The buy button is clicked | it's a plain link to the function's `/buy` address, with the token | logs `cta_click`, adds the "clicked buy" tag, looks up the email in Kit, starts the cart timer in Countdown Hero and sends the browser to the checkout. If either step fails: the buy "try again" page |
 
 - **Dragging doesn't count as watching.** A jump of more than 3 seconds between
   position updates is treated as dragging: no `progress` mark is sent for marks
@@ -23,9 +26,15 @@ video, the viewing tracking and the buy button. It talks to the
   `progress` marks from every visit in the current run.
 - **If a call fails** (network or a server problem), the page tries once more
   5 seconds later, then gives up quietly. The viewer never sees an error.
-- **No `indiv_token` in the address:** the video still plays, but nothing is
-  recorded, and the button leads to the "please click again" page (there's no
-  email to start a cart timer with).
+- **A missing or invalid `indiv_token`** sends the visitor to the registration
+  page before the video appears (re-registering resends their confirmation with
+  a good link), and admin is emailed.
+- **If the token check fails on our side** (the function can't be reached,
+  replies with an error, or hasn't answered within 5 seconds), the video is
+  shown anyway: our problem never stops a real viewer.
+- **In Kajabi's page editor** the check is skipped, so the page doesn't jump
+  away while you edit it. (Kajabi's preview runs the page inside a frame; the
+  check only runs on the page itself.)
 
 ## Settings
 
@@ -33,7 +42,7 @@ All at the top of the script, in the `SETTINGS` section:
 
 | Setting | What it is |
 |---|---|
-| `MILESTONE_URL` | the watch function's Function URL followed by `milestone` |
+| `MILESTONE_URL` | the watch function's Function URL followed by `milestone`. The token check (`watch-view`) and the buy button (`buy`) use the same Function URL, worked out from this |
 | `VIDEO_ID` | the Wistia video ID |
 | `T_START` | seconds of real playback before `started` (30) |
 | `T_PITCH` | when the pitch starts, in seconds. **Must match** `/zki/evergreen-watch/pitch-second` in Parameter Store: change both together |
@@ -72,9 +81,8 @@ The button wording is in the HTML near the top of the file.
    appear, and one `reached_pitch` call. In DynamoDB, that `reached_pitch` row
    shows `qualified` = false and lists the missing marks. In Kit: **no** "watched"
    tag, and the watch count is unchanged.
-3. Click the buy button. **Expect** a moment's pause, then the sales page with
-   the cart timer running and `cdt` and `indiv_token` in its address, and the
-   "clicked buy" tag in Kit.
+3. Click the buy button. **Expect** a moment's pause, then the **checkout**, and
+   in Kit the "clicked buy" tag, the cart-window tag and the cart deadline.
 
 **B. Watching properly** (about 10 minutes, using short plays)
 
@@ -88,7 +96,20 @@ The button wording is in the HTML near the top of the file.
 4. Reload, and reach the pitch again. **Expect** another qualified
    `reached_pitch` row, but the watch count does **not** go up (once per run).
 
-**C. Other website** (1 minute)
+**C. Token check** (2 minutes, in a private window)
+
+1. Open the watch page through its Countdown Hero page link as normal, then in
+   the address bar change one letter of the `indiv_token` and press Enter.
+   **Expect** the registration page, without the video ever appearing, a
+   `watch_page_view` row under `watch_page` with `token_status` `invalid`, and
+   a failure email.
+2. The same with `indiv_token=…` removed from the address. **Expect** the same,
+   with `token_status` `missing`.
+3. The page link as normal. **Expect** a moment's pause, then the video, and a
+   `watch_page_view` row under the subscriber. In the developer tools' Network
+   tab (filter `watch-view`), the call shows `200`.
+
+**D. Other website** (1 minute)
 
 Follow the website check in the function's README: a call from any other
 website is blocked.

@@ -64,16 +64,29 @@ the token, so this swaps one for the other:
   1. reads the subscriber from the token
   2. logs cta_click and tags <clicked-tag-id> in the background (as above)
   3. asks Kit for the subscriber's email (trying twice, briefly)
-  4. redirects the browser to <buy-link>, with {email} replaced by the email and
-     indiv_token added. Countdown Hero starts the cart timer (or keeps one that's
-     already running) and opens the sales page
+  4. POSTs {"subscriber": {"email_address": ...}} to <cart-trigger-endpoint>
+     (trying twice, briefly). Countdown Hero starts the cart timer (or keeps one
+     that's already running), which adds the cart-window tag and writes the deadline
+  5. redirects the browser to <checkout-url>
 
-If the token is missing or doesn't check out, or Kit can't give the email, the
-browser goes to <buy-fallback-url> instead (a page asking them to go back and
-click again), the click is still logged, and admin is emailed if Kit failed.
-A missing or invalid token is logged under subscriber_id "buy_button" with
-token_status "missing" or "invalid". The email is never logged or stored: it
-only appears in the redirect.
+If the token is missing or doesn't check out, the browser goes to
+<buy-fallback-url> and the click is logged under subscriber_id "buy_button"
+with token_status "missing" or "invalid". If Kit can't give the email or
+Countdown Hero doesn't accept the trigger, the browser goes to
+<buy-fallback-url> with indiv_token added (so that page's button can send them
+back here to try again), the click is still logged, and admin is emailed. The
+email is never logged or stored, and Countdown Hero's reply is never logged.
+
+Both watch pages check the token as soon as they load, before showing the video:
+
+    POST /watch-view
+    {"token": "<indiv_token>"}
+
+A good token logs watch_page_view under the subscriber and replies 200. A
+missing or invalid one logs watch_page_view under subscriber_id "watch_page"
+with token_status "missing" or "invalid", emails admin, and replies 403 with
+{"redirect": <bad-link-url>}; the page then sends the browser there. Never
+calls Kit.
 
 When the watch page's own Countdown Hero timer runs out, Countdown Hero sends
 the browser to its expired page, which is set to:
@@ -149,16 +162,21 @@ and the function refuses to run if any of these is missing:
                                 video. MUST match T_PITCH in the watch page script
     allowed-missing-marks       how many of the 10-minute marks before the pitch may be
                                 missing and still count as watching properly, e.g. 1
-    buy-link                    the Countdown Hero trigger link for the cart, with {email}
-                                where the email goes, e.g. https://example.com/t/abc/{email}
-    buy-fallback-url            where the buy button goes if the email can't be found,
-                                e.g. https://www.example.com/try-again
+    checkout-url                where the buy button sends people once the cart timer
+                                has started: the evergreen offer's checkout
+    cart-trigger-endpoint       the cart Countdown Hero's trigger address that accepts a
+                                POST with the email as JSON (the trigger link without
+                                the /email on the end)
+    buy-fallback-url            where the buy button goes if it can't start the cart:
+                                a page whose button sends them back to try again. No #
     in-cart-tag-id              Kit tag ID for "cart window open"
     cart-watch-link             the cart Countdown Hero's page link for the second copy of
                                 the watch page, with {email} where the email goes
     expired-url                 the "this has expired" page
     watch-expired-error-url     where /watch-expired sends people if Kit can't answer: a page
                                 whose button sends them back to try again
+    bad-link-url                where a watch page with a missing or invalid token sends
+                                people, e.g. the registration page
 
 Lambda environment variables (all optional except FAILURE_TOPIC_ARN):
   FAILURE_TOPIC_ARN     SNS topic for failure emails
@@ -198,6 +216,8 @@ KIT_API_BASE = "https://api.kit.com/v4/"
 KIT_TIMEOUT_SECONDS = 10
 BUY_KIT_TIMEOUT_SECONDS = 4   # someone is waiting on a click: keep each try short
 BUY_KIT_ATTEMPTS = 2
+CART_TRIGGER_TIMEOUT_SECONDS = 4   # someone is waiting on a click here too
+CART_TRIGGER_ATTEMPTS = 2
 KIT_TAGS_PER_PAGE = 1000   # Kit's maximum
 KIT_TAG_PAGES = 5
 MAX_EMAIL_LENGTH = 254
@@ -255,7 +275,7 @@ def handle_page_call(event, context):
         return handle_watch_expired(event)
     if http.get("method") != "POST":
         return respond(405, "POST only")
-    if path not in ("/milestone", "/page-view"):
+    if path not in ("/milestone", "/page-view", "/watch-view"):
         return respond(404, "Not found")
 
     try:
@@ -276,6 +296,8 @@ def handle_page_call(event, context):
 
     if path == "/page-view":
         return record_page_view(request, cfg)
+    if path == "/watch-view":
+        return record_watch_view(request, cfg)
     return record_milestone(request, cfg, context)
 
 
@@ -315,7 +337,7 @@ def record_milestone(request, cfg, context):
 
 
 def handle_buy(event, context):
-    """The buy button: swap the token for the email and send the browser on to Countdown Hero.
+    """The buy button: start the cart timer for this subscriber, then send the browser to checkout.
 
     A link click, not a script call, so there's no Origin check: anyone holding
     a token can only ever be sent to that subscriber's own cart.
@@ -349,10 +371,17 @@ def handle_buy(event, context):
     email, problem = subscriber_email(subscriber_id, cfg["kit_api_key"])
     if email is None:
         notify_failure(f"Buy button: could not get the email for subscriber {subscriber_id} from Kit "
-                       f"({problem}), so they were sent to the fallback page instead of the cart")
-        return redirect(cfg["buy_fallback_url"])
-    logger.info("Sent subscriber %s to the cart", subscriber_id)
-    return redirect(cart_link(cfg["buy_link"], email, token))
+                       f"({problem}), so they were sent to the fallback page instead of checkout")
+        return redirect(with_token(cfg["buy_fallback_url"], token))
+
+    problem = start_cart_timer(cfg["cart_trigger_endpoint"], email)
+    if problem:
+        notify_failure(f"Buy button: Countdown Hero did not start the cart timer for subscriber "
+                       f"{subscriber_id} ({problem}), so they were sent to the fallback page instead of checkout")
+        return redirect(with_token(cfg["buy_fallback_url"], token))
+
+    logger.info("Started the cart for subscriber %s and sent them to checkout", subscriber_id)
+    return redirect(cfg["checkout_url"])
 
 
 def handle_watch_expired(event):
@@ -482,6 +511,33 @@ def usable_email(email):
             and email.isprintable() and not any(c.isspace() for c in email))
 
 
+def start_cart_timer(endpoint, email):
+    """POST the email to Countdown Hero's trigger address, two short tries. None on success, else the problem.
+
+    Starting a timer that's already running keeps it, so trying again is safe.
+    Never logs the email or Countdown Hero's reply.
+    """
+    data = json.dumps({"subscriber": {"email_address": email}}).encode("utf-8")
+    problem = "no reply"
+    for _ in range(CART_TRIGGER_ATTEMPTS):
+        request = urllib.request.Request(endpoint, data=data, method="POST",
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=CART_TRIGGER_TIMEOUT_SECONDS) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+        except (urllib.error.URLError, TimeoutError, OSError):
+            problem = "a network error"
+            continue
+        if 200 <= status < 300:
+            return None
+        problem = f"status {status}"
+        if status != 429 and status < 500:
+            return problem  # refused: trying again won't help
+    return problem
+
+
 def cart_link(template, email, token):
     """A Countdown Hero link for this subscriber, with the token passed on to the Kajabi page."""
     return with_token(template.replace("{email}", quote(email, safe="@+")), token)
@@ -531,6 +587,31 @@ def record_page_view(request, cfg):
     return respond(200, "OK")
 
 
+def record_watch_view(request, cfg):
+    """A watch page has loaded: check its token before it shows the video. Never calls Kit."""
+    token = request.get("token")
+    subscriber_id = read_token(token, cfg["token_secret"]) if isinstance(token, str) and token else None
+    if subscriber_id is None:
+        status = "invalid" if token else "missing"
+        logger.warning("Watch page opened with %s token", "an invalid" if token else "a missing")
+        try:
+            log_event("watch_page", "watch_page_view", details={"token_status": status})
+        except Exception as error:
+            notify_failure(f"Could not write a watch_page_view event (token {status}) to {EVENTS_TABLE}: {error}")
+        notify_failure(f"A watch page was opened with a {status} indiv_token, so the visitor was sent to "
+                       f"bad-link-url instead of seeing the video")
+        return respond(403, "Forbidden", redirect=cfg["bad_link_url"])
+
+    try:
+        log_event(subscriber_id, "watch_page_view")
+    except Exception as error:
+        # Only the log is missing: never stop someone watching for this
+        notify_failure(f"Could not write watch_page_view event for subscriber {subscriber_id} "
+                       f"to {EVENTS_TABLE}: {error}")
+    logger.info("Recorded watch_page_view for subscriber %s", subscriber_id)
+    return respond(200, "OK")
+
+
 def utm_values(request):
     """The UTM values sent with a page view, trimmed. Anything that isn't short, printable text is left out."""
     values = {}
@@ -576,12 +657,12 @@ def log_event(subscriber_id, event_type, minute=None, source="watch_page", detai
     return item["event_at"]
 
 
-def respond(status_code, message):
+def respond(status_code, message, **extra):
     # No CORS headers here: the Function URL adds them. Adding them twice breaks browsers.
     return {
         "statusCode": status_code,
         "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"response": message}),
+        "body": json.dumps({"response": message, **extra}),
     }
 
 
@@ -830,12 +911,14 @@ def settings():
             "watch_count_field": own + "watch-count-field",
             "pitch_second": own + "pitch-second",
             "allowed_missing_marks": own + "allowed-missing-marks",
-            "buy_link": own + "buy-link",
+            "checkout_url": own + "checkout-url",
+            "cart_trigger_endpoint": own + "cart-trigger-endpoint",
             "buy_fallback_url": own + "buy-fallback-url",
             "in_cart_tag_id": own + "in-cart-tag-id",
             "cart_watch_link": own + "cart-watch-link",
             "expired_url": own + "expired-url",
             "watch_expired_error_url": own + "watch-expired-error-url",
+            "bad_link_url": own + "bad-link-url",
         }
         # GetParameters takes at most SSM_BATCH names per call
         wanted = list(names.values())
@@ -856,17 +939,20 @@ def settings():
         if not loaded["allowed_missing_marks"].isdigit():
             raise RuntimeError(f"{names['allowed_missing_marks']} must be a whole number (0 or more), "
                                f"got {loaded['allowed_missing_marks']!r}")
-        for key in ("allowed_origin", "buy_link", "buy_fallback_url", "cart_watch_link", "expired_url",
-                    "watch_expired_error_url"):
+        for key in ("allowed_origin", "checkout_url", "cart_trigger_endpoint", "buy_fallback_url",
+                    "cart_watch_link", "expired_url", "watch_expired_error_url", "bad_link_url"):
             if not loaded[key].startswith("https://"):
                 raise RuntimeError(f"{names[key]} must start with https://, got {loaded[key]!r}")
-        for key in ("buy_link", "cart_watch_link"):
-            if loaded[key].count("{email}") != 1 or "#" in loaded[key]:
-                raise RuntimeError(f"{names[key]} must contain {{email}} exactly once (where the email "
-                                   f"goes) and no #, got {loaded[key]!r}")
-        if "#" in loaded["watch_expired_error_url"]:
-            raise RuntimeError(f"{names['watch_expired_error_url']} must not contain #, "
-                               f"got {loaded['watch_expired_error_url']!r}")
+        if loaded["cart_watch_link"].count("{email}") != 1 or "#" in loaded["cart_watch_link"]:
+            raise RuntimeError(f"{names['cart_watch_link']} must contain {{email}} exactly once (where the "
+                               f"email goes) and no #, got {loaded['cart_watch_link']!r}")
+        if "{email}" in loaded["cart_trigger_endpoint"]:
+            raise RuntimeError(f"{names['cart_trigger_endpoint']} is the trigger address WITHOUT the email "
+                               f"(it's sent in the body), got {loaded['cart_trigger_endpoint']!r}")
+        for key in ("watch_expired_error_url", "buy_fallback_url"):
+            if "#" in loaded[key]:
+                raise RuntimeError(f"{names[key]} must not contain # (the token is added to it), "
+                                   f"got {loaded[key]!r}")
         _settings = loaded
     return _settings
 

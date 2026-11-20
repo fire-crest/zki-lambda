@@ -4,6 +4,8 @@
   Paste this whole file into ONE Kajabi "Custom Code" block on the watch page.
   The page address must carry the subscriber's token: ...?indiv_token=XXXX
   (In Kit emails: ?indiv_token={{ subscriber.indiv_token }})
+  The video only appears once the watch function has checked the token. A
+  missing or invalid token sends the browser to the function's bad-link-url.
 
   Only edit the SETTINGS section below (and the words in the button section if you want).
 -->
@@ -92,14 +94,14 @@
   // viewer dragged the video, so it doesn't count as watching. 3 allows for 2x speed.
   var MAX_STEP = 3;
 
+  // If the token check hasn't answered after this long, show the video anyway:
+  // a problem on our side must never stop a real viewer watching.
+  var CHECK_WAIT_MS = 5000;
+
   var token = new URLSearchParams(window.location.search).get("indiv_token");
   var sent = {};          // what has been sent on this page load
   var lastSecond = null;  // video position at the previous update
   var played = 0;         // seconds actually played on this page load
-
-  if (!token) {
-    console.log("Watch page: no indiv_token in the address, so viewing isn't recorded.");
-  }
 
   // ---- Sending milestones ----
 
@@ -133,8 +135,8 @@
   // ---- Buy button ----
 
   // A plain link to the same function's /buy address. It logs the click, looks
-  // up the email in Kit and sends the browser on to the Countdown Hero trigger
-  // link, which starts the cart timer and opens the sales page.
+  // up the email in Kit, starts the cart timer in Countdown Hero and sends the
+  // browser on to the checkout.
   var cta = document.getElementById("eg-cta");
   var buy = document.getElementById("eg-buy");
   buy.href = MILESTONE_URL.replace(/\/milestone\/?$/, "/buy") +
@@ -144,52 +146,88 @@
     cta.hidden = false;
   }
 
+  // ---- Token check: before the video appears ----
+
+  var videoShown = false;
+
+  function checkToken() {
+    // Inside Kajabi's page editor (a frame), skip the check so the page can be edited
+    if (window.self !== window.top) {
+      showVideo();
+      return;
+    }
+    setTimeout(showVideo, CHECK_WAIT_MS);
+    fetch(MILESTONE_URL.replace(/\/milestone\/?$/, "/watch-view"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token || "" })
+    }).then(function (response) {
+      return response.json().catch(function () { return {}; }).then(function (reply) {
+        // Only a definite "bad token" with somewhere to go leaves the page
+        if (response.status === 403 && reply && reply.redirect) {
+          window.location.replace(reply.redirect);
+        } else {
+          showVideo();
+        }
+      });
+    }).catch(function () {
+      showVideo(); // network problem: let them watch
+    });
+  }
+
   // ---- Video ----
 
-  var holder = document.getElementById("eg-video");
-  holder.innerHTML =
-    '<div class="wistia_responsive_wrapper">' +
-    '<div class="wistia_embed wistia_async_' + VIDEO_ID + ' seo=false videoFoam=true playerColor=' + PLAYER_COLOR + '" ' +
-    'style="height:100%;position:relative;width:100%"></div></div>';
-  [
-    "https://fast.wistia.com/embed/medias/" + VIDEO_ID + ".jsonp",
-    "https://fast.wistia.com/assets/external/E-v1.js"
-  ].forEach(function (src) {
-    var script = document.createElement("script");
-    script.src = src;
-    script.async = true;
-    document.head.appendChild(script);
-  });
+  function showVideo() {
+    if (videoShown) return;
+    videoShown = true;
 
-  window._wq = window._wq || [];
-  window._wq.push({
-    id: VIDEO_ID,
-    onReady: function (video) {
-      video.bind("secondchange", function (second) {
-        var step = lastSecond === null ? null : second - lastSecond;
-        var watching = step !== null && step > 0 && step <= MAX_STEP && video.state() === "playing";
+    var holder = document.getElementById("eg-video");
+    holder.innerHTML =
+      '<div class="wistia_responsive_wrapper">' +
+      '<div class="wistia_embed wistia_async_' + VIDEO_ID + ' seo=false videoFoam=true playerColor=' + PLAYER_COLOR + '" ' +
+      'style="height:100%;position:relative;width:100%"></div></div>';
+    [
+      "https://fast.wistia.com/embed/medias/" + VIDEO_ID + ".jsonp",
+      "https://fast.wistia.com/assets/external/E-v1.js"
+    ].forEach(function (src) {
+      var script = document.createElement("script");
+      script.src = src;
+      script.async = true;
+      document.head.appendChild(script);
+    });
 
-        if (watching) {
-          played += step;
-          if (played >= T_START) sendOnce("started", "started");
+    window._wq = window._wq || [];
+    window._wq.push({
+      id: VIDEO_ID,
+      onReady: function (video) {
+        video.bind("secondchange", function (second) {
+          var step = lastSecond === null ? null : second - lastSecond;
+          var watching = step !== null && step > 0 && step <= MAX_STEP && video.state() === "playing";
 
-          // Progress marks the video has just PLAYED across (dragging past them doesn't count)
-          for (var mark = Math.floor(lastSecond / LOG_EVERY) + 1; mark * LOG_EVERY <= second; mark++) {
-            var minute = mark * LOG_EVERY / 60;
-            sendOnce("progress-" + minute, "progress", { minute: minute });
+          if (watching) {
+            played += step;
+            if (played >= T_START) sendOnce("started", "started");
+
+            // Progress marks the video has just PLAYED across (dragging past them doesn't count)
+            for (var mark = Math.floor(lastSecond / LOG_EVERY) + 1; mark * LOG_EVERY <= second; mark++) {
+              var minute = mark * LOG_EVERY / 60;
+              sendOnce("progress-" + minute, "progress", { minute: minute });
+            }
           }
-        }
 
-        // Reaching the pitch by any route reveals the button. Lambda decides,
-        // from the progress marks, whether it counts as having watched properly.
-        if (second >= T_PITCH) {
-          revealBuyButton();
-          sendOnce("reached_pitch", "reached_pitch");
-        }
+          // Reaching the pitch by any route reveals the button. Lambda decides,
+          // from the progress marks, whether it counts as having watched properly.
+          if (second >= T_PITCH) {
+            revealBuyButton();
+            sendOnce("reached_pitch", "reached_pitch");
+          }
 
-        lastSecond = second;
-      });
-    }
-  });
+          lastSecond = second;
+        });
+      }
+    });
+  }
+
+  checkToken();
 })();
 </script>

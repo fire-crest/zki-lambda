@@ -7,9 +7,13 @@ event log, and the important ones are also recorded in Kit.
 It also counts visits to the registration page and the sales page
 ([Page views](#page-views) below). Those only go to the event log, never to Kit.
 
+Both watch pages check their token with this function before showing the
+video ([The watch page token check](#the-watch-page-token-check) below): a
+missing or invalid token sends the visitor to the registration page instead.
+
 The watch page's buy button is a link to this function too
-([The buy button](#the-buy-button) below): it swaps the token for the email and
-sends the browser on to the Countdown Hero cart timer.
+([The buy button](#the-buy-button) below): it swaps the token for the email,
+starts the Countdown Hero cart timer and sends the browser on to checkout.
 
 When the watch window runs out, the watch timer's expired redirect comes here
 as well ([When the watch window ends](#when-the-watch-window-ends) below): anyone
@@ -23,8 +27,10 @@ and `/kittag/` replay endpoints are separate and not yet migrated; see the main 
 flowchart TD
     Page["Watch page<br/>(allowed website)"] -->|"1. POST /milestone<br/>token + milestone"| Fn
     Views["Registration and<br/>sales pages"] -->|"POST /page-view<br/>log only"| Fn
+    Page -->|"on load:<br/>POST /watch-view"| Fn
     Page -->|"buy button:<br/>GET /buy?indiv_token="| Fn
-    Fn -->|"302 to the trigger link<br/>with the email"| CH["Countdown Hero<br/>then the sales page"]
+    Fn -->|"POST the email:<br/>starts the cart timer"| CH["Countdown Hero"]
+    Fn -->|"302 to checkout"| Checkout["Kajabi checkout"]
     WT["Watch timer<br/>runs out"] -->|"GET /watch-expired?indiv_token="| Fn
     Fn -->|"cart open: 302 to the replay copy<br/>no cart: 302 to the expired page"| CH
     subgraph AWS
@@ -103,6 +109,37 @@ A blank or non-numeric watch count counts as 0. The tag IDs, field name and
 allowed website all come from Parameter Store (step 2 below), so none of them
 appear in the code or this guide.
 
+## The watch page token check
+
+Countdown Hero lets someone onto a watch page using the email in its `cdt`
+parameter, but this function only knows people by their `indiv_token`. A watch
+page with a missing or broken token would play the video while recording
+nothing: no "watched" tag, so no cart. So the watch page block keeps the video
+hidden and, as soon as the page loads, sends:
+
+```json
+POST /watch-view
+{ "token": "<indiv_token>" }
+```
+
+| Token | Reply | Logged | Admin emailed | The page |
+|---|---|---|---|---|
+| good | `200` | `watch_page_view` under the subscriber | no | shows the video |
+| missing or not valid | `403` with `{"redirect": <bad-link-url>}` | `watch_page_view` under `watch_page`, `token_status` `missing` or `invalid` | **yes** | goes to `bad-link-url` (the registration page: re-registering resends the confirmation with a good link) |
+| call from another website | `403`, no redirect | — | no | shows the video |
+| the event log fails | as above (a good token still gets `200`) | — | yes | as above |
+| settings can't be loaded | `503` | — | yes | shows the video |
+
+The page only leaves when the reply is a `403` **with** a redirect. If the
+function can't be reached, replies with anything else, or hasn't answered
+within 5 seconds, the video is shown anyway: a problem on our side never stops
+a real viewer. Inside Kajabi's page editor (a frame) the check is skipped, so
+the page can still be edited. Never calls Kit.
+
+Someone who shares the **whole** address (with their own `cdt` and token) still
+shares their viewing until their own deadline, and the viewing is logged as
+theirs. Only a login could stop that; accepted 19 Nov.
+
 ## The buy button
 
 Countdown Hero keys each cart timer on the subscriber's **email**, but the watch
@@ -117,25 +154,33 @@ and the function:
 1. reads the subscriber from the token;
 2. logs `cta_click` and adds the "clicked buy" tag in the background, exactly as the milestone did;
 3. asks Kit for the subscriber's email (up to two tries of 4 seconds);
-4. redirects the browser (`302`) to `buy-link`, with `{email}` replaced by the
-   email and `indiv_token` added. Countdown Hero starts the timer, or keeps one
-   that's already running (first trigger wins), and opens the sales page with
-   `cdt` and `indiv_token` in the address.
+4. POSTs `{"subscriber": {"email_address": "<email>"}}` to `cart-trigger-endpoint`
+   (up to two tries of 4 seconds; any `2xx` reply counts). Countdown Hero starts
+   the cart timer, or keeps one that's already running (first trigger wins), and
+   does its "on trigger" actions: adds the cart-window tag and writes the deadline;
+5. redirects the browser (`302`) to `checkout-url`.
+
+A `429`, `5xx` or network error from Countdown Hero is tried once more; any
+other reply isn't. Sending the trigger twice is harmless.
 
 | Problem | Where the browser goes | Logged | Admin emailed |
 |---|---|---|---|
-| none | the cart (`buy-link`) | `cta_click` under the subscriber | no |
-| Kit busy, broken or unreachable twice, or no usable email | `buy-fallback-url` | `cta_click` under the subscriber | yes |
-| token missing or not valid | `buy-fallback-url` | `cta_click` under `buy_button`, `token_status` `missing` or `invalid` | no |
-| the event log or the background tag job fails | the cart (the sale isn't stopped) | — | yes |
+| none | checkout (`checkout-url`) | `cta_click` under the subscriber | no |
+| Kit busy, broken or unreachable twice, or no usable email | `buy-fallback-url` **with `indiv_token`** | `cta_click` under the subscriber | yes |
+| Countdown Hero doesn't accept the trigger | `buy-fallback-url` **with `indiv_token`** | `cta_click` under the subscriber | yes |
+| token missing or not valid | `buy-fallback-url` (no token) | `cta_click` under `buy_button`, `token_status` `missing` or `invalid` | no |
+| the event log or the background tag job fails | checkout (the sale isn't stopped) | — | yes |
 | settings can't be loaded | an error (`503`) | — | yes |
 
-`buy-fallback-url` is a small page asking them to go back and click the button
-again. The email is never logged or stored: it only appears in the redirect,
-and so in the Countdown Hero link and the sales page address. It's a link, not
-a script call, so there's no website check: a token only ever leads to its own
-subscriber's cart. Replies are marked `Cache-Control: no-store` so a browser
-never reuses an old redirect.
+`buy-fallback-url` is a small page with a "try again" button. Its block,
+[`page-views/buy-try-again-page.js`](page-views/), points the button back at
+`/buy` with the page's `indiv_token`, so one click tries again; with no token it
+goes to the registration page instead. The email is never logged or stored,
+and neither is Countdown Hero's reply. It's a link, not a script call, so
+there's no website check: a token only ever starts its own subscriber's cart.
+Replies are marked `Cache-Control: no-store` so a browser never reuses an old
+redirect. The checkout address itself isn't protected by the timer, so someone
+who keeps it can still buy after the deadline (accepted 19 Nov).
 
 ## When the watch window ends
 
@@ -230,15 +275,15 @@ buying. It can never exceed the registration count, which counts runs started.
 |---|---|---|
 | `subscriber_id` | `1234567890` | partition key |
 | `event_at` | `2026-11-06T14:12:03.123Z#a1b2c3` | sort key: UTC time, plus a random suffix so two events in the same millisecond don't collide |
-| `subscriber_id` (page views) | `registration_page`, `sales_page`, `buy_button`, `watch_expired` | anonymous page views (see [Page views](#page-views)), and buy clicks or watch window expiries with a missing or invalid token |
-| `event` | `started`, `progress`, `reached_pitch`, `cta_click`, `registration_page_view`, `sales_page_visit`, `watch_expired_redirect` | |
+| `subscriber_id` (page views) | `registration_page`, `sales_page`, `buy_button`, `watch_expired`, `watch_page` | anonymous page views (see [Page views](#page-views)), and buy clicks, watch window expiries or watch page loads with a missing or invalid token |
+| `event` | `started`, `progress`, `reached_pitch`, `cta_click`, `registration_page_view`, `sales_page_visit`, `watch_expired_redirect`, `watch_page_view` | |
 | `minute` | `20` | `progress` only |
 | `qualified` | `true` | `reached_pitch` only: whether they watched properly |
 | `missing_marks` | `[70]` | `reached_pitch` only: the required marks they hadn't played through |
 | `source` | `watch_page`, `registration_page`, `sales_page`, `buy_button`, `watch_expired` | |
 | `outcome` | `cart`, `expired`, `error` | `watch_expired_redirect` only: where they were sent |
 | `utm_source`, `utm_medium`, `utm_campaign`, `utm_content` | `meta` | page views only, when the address had them |
-| `token_status` | `valid`, `missing`, `invalid` | `sales_page_visit`, and anonymous `cta_click` and `watch_expired_redirect` rows (`missing` or `invalid`) |
+| `token_status` | `valid`, `missing`, `invalid` | `sales_page_visit`, and anonymous `cta_click`, `watch_expired_redirect` and `watch_page_view` rows (`missing` or `invalid`) |
 | `pitch_counted_at` | `2026-11-07T10:20:01+00:00` | on `registered` rows only: set when that registration's watch has been counted |
 
 The index `by_event` (partition `event`, sort `event_at`) answers "all `started` events between two dates". Rows
@@ -259,11 +304,12 @@ matched to a person or a run; watch their number for broken links.
 | `lambda_function.py` | The function |
 | `kit_token.py` | Reads tokens. Identical to the copy in `kit-set-indiv-token-python`: keep them the same |
 | `test_lambda_function.py` | Tests (`python3 -m unittest -v`). No AWS or Kit needed. The event log tests also need `pip install "moto[dynamodb]"`, and are skipped without it |
-| `watch-page/watch-page.html` | The watch page block: video, tracking and buy button. Paste into a Kajabi Custom Code block |
+| `watch-page/watch-page.html` | The watch page block: token check, video, tracking and buy button. Paste into a Kajabi Custom Code block |
 | `watch-page/README.md` | How the page works, its settings, and how to test it in a browser |
 | `page-views/registration-page.js` | Registration page block: page view counter, UTMs into the Kit form, email hand-off. Paste into the page's Custom Javascript |
 | `page-views/sales-page.js` | Sales page visit counter. Paste into the page's Custom Javascript |
 | `page-views/replay-try-again-page.js` | For the replay "try again" page: points its button back at `/watch-expired` with the token. Paste into the page's Custom Javascript |
+| `page-views/buy-try-again-page.js` | For the buy "try again" page: points its button back at `/buy` with the token (or the registration page without one). Paste into the page's Custom Javascript |
 | `page-views/README.md` | How to add the blocks and test them |
 
 It needs the same `cryptography-py313-arm64` layer as `kit-set-indiv-token`.
@@ -296,12 +342,16 @@ in **Systems Manager → Parameter Store**, each with **Tier: Standard** and
 | `/zki/evergreen-watch/clicked-tag-id` | ID of the Kit tag for "clicked the buy button" |
 | `/zki/evergreen-watch/pitch-second` | When the pitch starts, in seconds (e.g. 4329 for 72:09). **Must match `T_PITCH` in the watch page**: change both together |
 | `/zki/evergreen-watch/allowed-missing-marks` | How many 10-minute marks before the pitch may be missing, e.g. `1` |
-| `/zki/evergreen-watch/buy-link` | The cart Countdown Hero's **trigger link**, with `{email}` typed where the email goes (Countdown Hero puts it at the end of the path), e.g. `https://…/{email}`. Must start with https, contain `{email}` exactly once, and have no `#` |
-| `/zki/evergreen-watch/buy-fallback-url` | The page the buy button goes to if the email can't be found ("please go back and click again"), e.g. `https://www.example.com/try-again` |
+| `/zki/evergreen-watch/checkout-url` | The evergreen offer's **checkout** address, where the buy button sends people once their cart timer has started. Must start with https |
+| `/zki/evergreen-watch/cart-trigger-endpoint` | The cart Countdown Hero's trigger address that accepts a POST: the trigger link **without** the `/email` on the end (the email goes in the body). Must start with https and must not contain `{email}` |
+| `/zki/evergreen-watch/buy-fallback-url` | The buy "try again" page, for when the cart can't be started (its block sends them back to `/buy`). Must start with https and have no `#` |
 | `/zki/evergreen-watch/in-cart-tag-id` | ID of the Kit tag for "cart window open" |
 | `/zki/evergreen-watch/cart-watch-link` | The **cart** Countdown Hero's **page link** for the second copy of the watch page, with `{email}` typed where the email goes, e.g. `https://…/{email}`. Must start with https, contain `{email}` exactly once, and have no `#` |
 | `/zki/evergreen-watch/expired-url` | The "this has expired" page |
 | `/zki/evergreen-watch/watch-expired-error-url` | The replay "try again" page, for when Kit can't answer. Must start with https and have no `#` |
+| `/zki/evergreen-watch/bad-link-url` | Where a watch page with a missing or invalid token sends the visitor: the registration page. Must start with https |
+
+`buy-link` is no longer used: delete it once this version is live.
 
 To find a tag's ID in Kit, open the tag: the ID is the number at the end of the
 page address. A custom field's key is shown in Kit's custom field settings.
@@ -410,7 +460,8 @@ aws lambda add-permission --function-name evergreen-sms-webinar-watch --statemen
 
 The watch page's endpoint is the Function URL followed by `milestone`, e.g.
 `https://abc123….lambda-url.REGION.on.aws/milestone`. The registration and sales
-pages use the same Function URL followed by `page-view`. All three pages must be
+pages use the same Function URL followed by `page-view`, and the watch pages'
+token check uses it followed by `watch-view`. All these pages must be
 on the `allowed-origin` website. The buy button uses the Function URL followed
 by `buy`; the watch page works this out from its `MILESTONE_URL`. The watch
 timer's expired page is the Function URL followed by `watch-expired`. Both are
@@ -462,10 +513,19 @@ count, and a failure email saying they had no run on record.
 
 | # | Address | Expect |
 |---|---|---|
-| 1 | with the test subscriber's token | Countdown Hero's page opens with the timer running; the address has `cdt` and `indiv_token`. A `cta_click` row, and the "clicked buy" tag |
-| 2 | the same again | the same timer, not restarted (first trigger wins) |
-| 3 | `TOKEN-WITH-ONE-LETTER-CHANGED` | the fallback page. A `cta_click` row under `buy_button` with `token_status` `invalid` |
-| 4 | with no `?indiv_token=` at all | the fallback page. `token_status` `missing` |
+| 1 | with the test subscriber's token | the **checkout** page. A `cta_click` row and the "clicked buy" tag; within about 30 seconds Countdown Hero's contacts list for the cart timer has them, and Kit shows the cart-window tag and the cart deadline in the expiry field |
+| 2 | the same again | checkout again; the same timer, not restarted (first trigger wins) |
+| 3 | `TOKEN-WITH-ONE-LETTER-CHANGED` | the fallback page, with **no** token in its address; its button goes to the registration page. A `cta_click` row under `buy_button` with `token_status` `invalid` |
+| 4 | with no `?indiv_token=` at all | as 3, with `token_status` `missing` |
+| 5 | set `cart-trigger-endpoint` to the same address with the **whole** code at the end replaced by something made up, e.g. `…/xxxxxxxx` (changing one letter isn't enough: Countdown Hero seems to ignore some characters, found 20 Nov), and nudge the function so it reloads. Then repeat 1 | the fallback page **with** `indiv_token` in its address, and a failure email naming Countdown Hero. Put the setting back, nudge the function again, then click the page's button: checkout |
+
+**The watch page token check.** POST to `…on.aws/watch-view`:
+
+| # | Body | Expect |
+|---|---|---|
+| 1 | `{"token": "TOKEN"}` | `200`. A `watch_page_view` row under the subscriber |
+| 2 | `{"token": "TOKEN-WITH-ONE-LETTER-CHANGED"}` | `403` with `"redirect"` set to `bad-link-url`. A row under `watch_page`, `token_status` `invalid`, and a failure email |
+| 3 | `{}` | the same, with `token_status` `missing` |
 
 **The end of the watch window.** In a private window, open
 `…on.aws/watch-expired?indiv_token=TOKEN`:

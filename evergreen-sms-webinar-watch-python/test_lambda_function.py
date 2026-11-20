@@ -38,13 +38,15 @@ TEST_SETTINGS = {
     "clicked_tag_id": os.environ.get("TEST_CLICKED_TAG_ID", "1000003"),
     "pitch_second": os.environ.get("TEST_PITCH_SECOND", "4329"),          # 72:09 -> marks 10..70
     "allowed_missing_marks": os.environ.get("TEST_ALLOWED_MISSING_MARKS", "1"),
-    "buy_link": os.environ.get("TEST_BUY_LINK", "https://timer.example.com/t/abc123/{email}"),
+    "checkout_url": os.environ.get("TEST_CHECKOUT_URL", "https://shop.example.com/offers/abc/checkout"),
+    "cart_trigger_endpoint": os.environ.get("TEST_CART_TRIGGER_ENDPOINT", "https://timer.example.com/t/abc123"),
     "buy_fallback_url": os.environ.get("TEST_BUY_FALLBACK_URL", "https://www.example.com/try-again"),
     "in_cart_tag_id": os.environ.get("TEST_IN_CART_TAG_ID", "1000004"),
     "cart_watch_link": os.environ.get("TEST_CART_WATCH_LINK", "https://timer.example.com/p/def456/{email}"),
     "expired_url": os.environ.get("TEST_EXPIRED_URL", "https://www.example.com/expired"),
     "watch_expired_error_url": os.environ.get("TEST_WATCH_EXPIRED_ERROR_URL",
                                               "https://www.example.com/replay-try-again"),
+    "bad_link_url": os.environ.get("TEST_BAD_LINK_URL", "https://www.example.com/register"),
 }
 SUB = os.environ.get("TEST_SUBSCRIBER_ID", "1234567890")
 
@@ -680,9 +682,11 @@ class BuyTests(PageFakes, unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.object(fn, "kit_request", return_value=kit_reply())
-        self.kit = patcher.start()
-        self.addCleanup(patcher.stop)
+        patchers = [mock.patch.object(fn, "kit_request", return_value=kit_reply()),
+                    mock.patch.object(fn, "start_cart_timer", return_value=None)]
+        self.kit, self.trigger = [p.start() for p in patchers]
+        for p in patchers:
+            self.addCleanup(p.stop)
 
     def buy(self, query={"indiv_token": TOKEN}, **kwargs):
         with self.assertLogs(fn.logger, level="INFO") as logs:
@@ -696,19 +700,21 @@ class BuyTests(PageFakes, unittest.TestCase):
         self.assertEqual(result["headers"]["Location"], location)
         self.assertEqual(result["headers"]["Cache-Control"], "no-store")
 
-    def expected_cart_link(self, email=EMAIL):
-        return (TEST_SETTINGS["buy_link"].replace("{email}", quote(email, safe="@+"))
-                + "?indiv_token=" + quote(TOKEN, safe=""))
+    def fallback_with_token(self):
+        return TEST_SETTINGS["buy_fallback_url"] + "?indiv_token=" + quote(TOKEN, safe="")
 
-    def test_sends_to_cart_with_email_and_token(self):
-        result = self.buy()
-        self.assertRedirect(result, self.expected_cart_link())
-        location = result["headers"]["Location"]
-        self.assertIn("/" + EMAIL + "?", location)                       # email at the end of the path
-        self.assertEqual(parse_qs(urlsplit(location).query)["indiv_token"], [TOKEN])
+    def test_starts_cart_then_sends_to_checkout(self):
+        self.assertRedirect(self.buy(), TEST_SETTINGS["checkout_url"])
         self.kit.assert_called_once()
         self.assertEqual(self.kit.call_args.args[:2], ("GET", f"subscribers/{SUB}"))
         self.assertEqual(self.kit.call_args.kwargs["timeout"], fn.BUY_KIT_TIMEOUT_SECONDS)
+        self.trigger.assert_called_once_with(TEST_SETTINGS["cart_trigger_endpoint"], EMAIL)
+        self.notify.assert_not_called()
+
+    def test_checkout_address_has_no_email_or_token(self):
+        location = self.buy()["headers"]["Location"]
+        self.assertNotIn(EMAIL, location)
+        self.assertNotIn(TOKEN, location)
 
     def test_logs_and_tags_the_click(self):
         self.buy()
@@ -716,7 +722,6 @@ class BuyTests(PageFakes, unittest.TestCase):
         self.assertEqual((row["subscriber_id"], row["event"], row["source"]), (SUB, "cta_click", "watch_page"))
         self.assertEqual(self.jobs(), [{"job": "kit_actions", "subscriber_id": SUB, "milestone": "cta_click",
                                         "event_at": row["event_at"]}])
-        self.notify.assert_not_called()
 
     def test_email_never_logged_or_stored(self):
         self.buy()
@@ -724,39 +729,30 @@ class BuyTests(PageFakes, unittest.TestCase):
         self.assertNotIn(EMAIL, json.dumps(self.logged()))
         self.assertNotIn(EMAIL, json.dumps(self.jobs()))
 
-    def test_link_with_existing_query(self):
-        with mock.patch.dict(SECRETS, {"buy_link": "https://timer.example.com/t/{email}?x=1"}):
-            location = self.buy()["headers"]["Location"]
-        self.assertTrue(location.startswith("https://timer.example.com/t/" + EMAIL + "?x=1&indiv_token="))
-
-    def test_odd_characters_in_email_are_encoded(self):
-        self.kit.return_value = kit_reply("o'brien/x?y#z@example.com")
-        location = self.buy()["headers"]["Location"]
-        self.assertIn("/o%27brien%2Fx%3Fy%23z@example.com?indiv_token=", location)
-
     def test_missing_and_invalid_tokens_go_to_fallback(self):
         bad = kit_token.make_token(SUB, OTHER_KEY)
         for query, status in [(None, "missing"), ({}, "missing"), ({"indiv_token": ""}, "missing"),
                               ({"indiv_token": bad}, "invalid"), ({"indiv_token": "junk"}, "invalid")]:
             self.table.reset_mock()
-            self.assertRedirect(self.buy(query), TEST_SETTINGS["buy_fallback_url"])
+            self.assertRedirect(self.buy(query), TEST_SETTINGS["buy_fallback_url"])  # no token added
             [row] = self.logged()
             self.assertEqual((row["subscriber_id"], row["event"], row["token_status"]),
                              ("buy_button", "cta_click", status), query)
         self.kit.assert_not_called()
+        self.trigger.assert_not_called()
         self.assertEqual(self.jobs(), [])
 
     def test_kit_busy_then_ok(self):
         self.kit.side_effect = [(503, "busy"), kit_reply()]
-        self.assertRedirect(self.buy(), self.expected_cart_link())
+        self.assertRedirect(self.buy(), TEST_SETTINGS["checkout_url"])
         self.assertEqual(self.kit.call_count, 2)
         self.notify.assert_not_called()
 
     def test_kit_network_error_then_ok(self):
         self.kit.side_effect = [fn.RetryableError("timeout"), kit_reply()]
-        self.assertRedirect(self.buy(), self.expected_cart_link())
+        self.assertRedirect(self.buy(), TEST_SETTINGS["checkout_url"])
 
-    def test_kit_failing_goes_to_fallback_and_emails_admin(self):
+    def test_kit_failing_goes_to_fallback_with_token_and_emails_admin(self):
         for side_effect, calls in [([(429, "slow down"), (500, "err")], 2),
                                    ([fn.RetryableError("x"), fn.RetryableError("y")], 2),
                                    ([(404, "not found")], 1),
@@ -767,11 +763,29 @@ class BuyTests(PageFakes, unittest.TestCase):
             self.kit.reset_mock(side_effect=True)
             self.notify.reset_mock()
             self.kit.side_effect = side_effect
-            self.assertRedirect(self.buy(), TEST_SETTINGS["buy_fallback_url"])
+            self.assertRedirect(self.buy(), self.fallback_with_token())
             self.assertEqual(self.kit.call_count, calls, side_effect)
             self.notify.assert_called_once()
             self.assertIn(SUB, self.notify.call_args.args[0])
+        self.trigger.assert_not_called()
         self.assertTrue(all(row["event"] == "cta_click" for row in self.logged()))  # still logged
+
+    def test_cart_timer_failing_goes_to_fallback_with_token_and_emails_admin(self):
+        self.trigger.return_value = "status 500"
+        self.assertRedirect(self.buy(), self.fallback_with_token())
+        self.notify.assert_called_once()
+        message = self.notify.call_args.args[0]
+        self.assertIn(SUB, message)
+        self.assertIn("status 500", message)
+        self.assertNotIn(EMAIL, message)
+        self.assertEqual(self.logged()[0]["event"], "cta_click")  # still logged and tagged
+        self.assertEqual(len(self.jobs()), 1)
+
+    def test_fallback_with_existing_query(self):
+        self.trigger.return_value = "status 500"
+        with mock.patch.dict(SECRETS, {"buy_fallback_url": "https://www.example.com/try-again?x=1"}):
+            location = self.buy()["headers"]["Location"]
+        self.assertEqual(location, "https://www.example.com/try-again?x=1&indiv_token=" + quote(TOKEN, safe=""))
 
     def test_failure_email_has_no_email_address(self):
         self.kit.return_value = (200, json.dumps({"subscriber": {"email_address": EMAIL + " "}}))
@@ -782,12 +796,13 @@ class BuyTests(PageFakes, unittest.TestCase):
     def test_log_and_job_failures_dont_stop_the_sale(self):
         self.table.return_value.put_item.side_effect = Exception("dynamo down")
         self.lambda_client.return_value.invoke.side_effect = Exception("boom")
-        self.assertRedirect(self.buy(), self.expected_cart_link())
+        self.assertRedirect(self.buy(), TEST_SETTINGS["checkout_url"])
         self.assertEqual(self.notify.call_count, 2)
 
     def test_settings_failure(self):
         self.settings.side_effect = Exception("no ssm")
         self.assertEqual(self.buy()["statusCode"], 503)
+        self.trigger.assert_not_called()
 
     def test_get_only(self):
         self.assertEqual(self.buy(method="POST")["statusCode"], 405)
@@ -797,6 +812,142 @@ class BuyTests(PageFakes, unittest.TestCase):
     def test_milestone_cta_click_still_accepted(self):
         # An old copy of the watch page may still send it
         self.assertEqual(self.call({"token": TOKEN, "milestone": "cta_click"})["statusCode"], 200)
+
+
+class FakeReply:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def http_error(status):
+    return fn.urllib.error.HTTPError("https://timer.example.com/t/abc123", status, "err", {}, None)
+
+
+class StartCartTimerTests(unittest.TestCase):
+    """start_cart_timer: the POST to Countdown Hero."""
+
+    ENDPOINT = TEST_SETTINGS["cart_trigger_endpoint"]
+
+    def setUp(self):
+        patcher = mock.patch.object(fn.urllib.request, "urlopen")
+        self.urlopen = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def start(self):
+        with self.assertLogs(fn.logger, level="INFO") as logs:
+            fn.logger.info("start")
+            problem = fn.start_cart_timer(self.ENDPOINT, EMAIL)
+        self.assertNotIn(EMAIL, "\n".join(logs.output))
+        return problem
+
+    def test_posts_email_as_json(self):
+        self.urlopen.return_value = FakeReply(200)
+        self.assertIsNone(self.start())
+        [call] = self.urlopen.call_args_list
+        request = call.args[0]
+        self.assertEqual(request.full_url, self.ENDPOINT)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(json.loads(request.data), {"subscriber": {"email_address": EMAIL}})
+        self.assertEqual(call.kwargs["timeout"], fn.CART_TRIGGER_TIMEOUT_SECONDS)
+
+    def test_any_2xx_is_success(self):
+        for status in (200, 201, 204):
+            self.urlopen.reset_mock()
+            self.urlopen.return_value = FakeReply(status)
+            self.assertIsNone(self.start(), status)
+            self.assertEqual(self.urlopen.call_count, 1)
+
+    def test_busy_or_network_error_tried_twice(self):
+        for side_effect in ([http_error(503), FakeReply(200)], [http_error(429), FakeReply(200)],
+                            [fn.urllib.error.URLError("down"), FakeReply(200)], [TimeoutError(), FakeReply(200)]):
+            self.urlopen.reset_mock(side_effect=True)
+            self.urlopen.side_effect = side_effect
+            self.assertIsNone(self.start(), side_effect)
+            self.assertEqual(self.urlopen.call_count, 2)
+
+    def test_gives_up_after_two_tries(self):
+        self.urlopen.side_effect = [http_error(500), http_error(502)]
+        self.assertEqual(self.start(), "status 502")
+        self.urlopen.side_effect = [TimeoutError(), TimeoutError()]
+        self.assertEqual(self.start(), "a network error")
+
+    def test_refusal_not_retried(self):
+        for status in (400, 404):
+            self.urlopen.reset_mock(side_effect=True)
+            self.urlopen.side_effect = [http_error(status)]
+            self.assertEqual(self.start(), f"status {status}")
+            self.assertEqual(self.urlopen.call_count, 1)
+
+    def test_odd_non_error_status_is_a_problem(self):
+        self.urlopen.return_value = FakeReply(302)
+        self.assertEqual(self.start(), "status 302")
+
+
+class WatchViewTests(PageFakes, unittest.TestCase):
+    """POST /watch-view: the watch pages check their token before showing the video."""
+
+    def view(self, body, **kwargs):
+        return self.call(body, path="/watch-view", **kwargs)
+
+    def test_good_token_logged_under_subscriber(self):
+        result = self.view({"token": TOKEN})
+        self.assertEqual(result["statusCode"], 200)
+        [row] = self.logged()
+        self.assertEqual((row["subscriber_id"], row["event"], row["source"]), (SUB, "watch_page_view", "watch_page"))
+        self.notify.assert_not_called()
+        self.assertEqual(self.jobs(), [])
+        self.assertNotIn("redirect", json.loads(result["body"]))
+
+    def test_missing_and_invalid_tokens_sent_to_bad_link_page_and_flagged(self):
+        tampered = TOKEN[:-1] + ("A" if TOKEN[-1] != "A" else "B")
+        for body, status in [({}, "missing"), ({"token": None}, "missing"), ({"token": ""}, "missing"),
+                             ({"token": "junk"}, "invalid"), ({"token": tampered}, "invalid"),
+                             ({"token": kit_token.make_token(SUB, OTHER_KEY)}, "invalid"),
+                             ({"token": 12345}, "invalid"), ({"token": SUB}, "invalid")]:
+            self.table.reset_mock()
+            self.notify.reset_mock()
+            result = self.view(body)
+            self.assertEqual(result["statusCode"], 403, body)
+            self.assertEqual(json.loads(result["body"])["redirect"], TEST_SETTINGS["bad_link_url"])
+            [row] = self.logged()
+            self.assertEqual((row["subscriber_id"], row["event"], row["token_status"]),
+                             ("watch_page", "watch_page_view", status), body)
+            self.notify.assert_called_once()
+            self.assertIn(status, self.notify.call_args.args[0])
+        self.assertEqual(self.jobs(), [])
+
+    def test_log_failure_never_stops_a_good_viewer(self):
+        self.table.return_value.put_item.side_effect = Exception("dynamo down")
+        self.assertEqual(self.view({"token": TOKEN})["statusCode"], 200)
+        self.notify.assert_called_once()
+
+    def test_log_failure_still_redirects_a_bad_token(self):
+        self.table.return_value.put_item.side_effect = Exception("dynamo down")
+        result = self.view({"token": "junk"})
+        self.assertEqual(result["statusCode"], 403)
+        self.assertEqual(json.loads(result["body"])["redirect"], TEST_SETTINGS["bad_link_url"])
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_other_websites_refused_without_a_redirect(self):
+        result = self.view({"token": "junk"}, origin="https://evil.example")
+        self.assertEqual(result["statusCode"], 403)
+        self.assertNotIn("redirect", json.loads(result["body"]))
+        self.assertEqual(self.logged(), [])
+
+    def test_wrong_method_and_body(self):
+        self.assertEqual(self.view({"token": TOKEN}, method="GET")["statusCode"], 405)
+        self.assertEqual(self.view("not json")["statusCode"], 400)
+
+    def test_settings_failure(self):
+        self.settings.side_effect = Exception("no ssm")
+        self.assertEqual(self.view({"token": TOKEN})["statusCode"], 503)
 
 
 def watch_expired_call(query, method="GET"):
@@ -986,12 +1137,14 @@ class SettingsTests(unittest.TestCase):
             self.OWN + "clicked-tag-id": CLICKED_TAG,
             self.OWN + "pitch-second": str(PITCH_SECOND) + "\n",
             self.OWN + "allowed-missing-marks": str(ALLOWED_MISSING),
-            self.OWN + "buy-link": TEST_SETTINGS["buy_link"] + " ",
+            self.OWN + "checkout-url": TEST_SETTINGS["checkout_url"] + " ",
+            self.OWN + "cart-trigger-endpoint": TEST_SETTINGS["cart_trigger_endpoint"],
             self.OWN + "buy-fallback-url": TEST_SETTINGS["buy_fallback_url"],
             self.OWN + "in-cart-tag-id": TEST_SETTINGS["in_cart_tag_id"] + "\n",
             self.OWN + "cart-watch-link": TEST_SETTINGS["cart_watch_link"],
             self.OWN + "expired-url": " " + TEST_SETTINGS["expired_url"],
             self.OWN + "watch-expired-error-url": TEST_SETTINGS["watch_expired_error_url"],
+            self.OWN + "bad-link-url": TEST_SETTINGS["bad_link_url"] + "\n",
         }
 
     def load(self, overrides=None):
@@ -1017,7 +1170,7 @@ class SettingsTests(unittest.TestCase):
     def test_loads_once_and_strips(self):
         cfg, ssm = self.load()
         self.assertEqual(cfg, SECRETS)
-        # 15 settings: two calls the first time, none the second (loaded once per container)
+        # 17 settings: two calls the first time, none the second (loaded once per container)
         self.assertEqual(ssm.return_value.get_parameters.call_count, 2)
 
     def test_each_setting_required(self):
@@ -1037,11 +1190,13 @@ class SettingsTests(unittest.TestCase):
                           (self.OWN + "pitch-second", "999999"),
                           (self.OWN + "allowed-missing-marks", "-1"),
                           (self.OWN + "allowed-missing-marks", "one"),
-                          (self.OWN + "buy-link", "http://timer.example.com/t/{email}"),
-                          (self.OWN + "buy-link", "https://timer.example.com/t/abc123"),
-                          (self.OWN + "buy-link", "https://timer.example.com/{email}/{email}"),
-                          (self.OWN + "buy-link", "https://timer.example.com/t/{email}#x"),
+                          (self.OWN + "checkout-url", "shop.example.com/checkout"),
+                          (self.OWN + "checkout-url", "http://shop.example.com/checkout"),
+                          (self.OWN + "cart-trigger-endpoint", "http://timer.example.com/t/abc123"),
+                          (self.OWN + "cart-trigger-endpoint", "https://timer.example.com/t/abc123/{email}"),
                           (self.OWN + "buy-fallback-url", "www.example.com/try-again"),
+                          (self.OWN + "buy-fallback-url", "https://www.example.com/try-again#x"),
+                          (self.OWN + "bad-link-url", "www.example.com/register"),
                           (self.OWN + "in-cart-tag-id", "in_cart_window"),
                           (self.OWN + "cart-watch-link", "https://timer.example.com/p/def456"),
                           (self.OWN + "cart-watch-link", "http://timer.example.com/p/{email}"),
@@ -1074,7 +1229,8 @@ class PageBlockTests(unittest.TestCase):
 
     def blocks(self):
         names = sorted(n for n in os.listdir(self.FOLDER) if n.endswith(".js"))
-        self.assertEqual(names, ["registration-page.js", "replay-try-again-page.js", "sales-page.js"])
+        self.assertEqual(names, ["buy-try-again-page.js", "registration-page.js", "replay-try-again-page.js",
+                                 "sales-page.js"])
         for name in names:
             with open(os.path.join(self.FOLDER, name), encoding="utf-8") as f:
                 yield name, f.read()
